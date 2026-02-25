@@ -1,0 +1,797 @@
+`timescale 1ns/1ps
+
+module rssi_gain_calib_top #(
+    parameter TARGET_RSSI = 1000
+)(
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        start,
+    input  wire [15:0] lo_freq_mhz,
+    input  wire [7:0]  gain_step_index,
+    input  wire [15:0] rssi_in,
+
+    output wire        spi_cs,
+    output wire        spi_clk,
+    output wire        spi_mosi,
+    output reg         calib_done
+);
+
+    //-----------------------------
+    // BAND SELECTION
+    //-----------------------------
+    reg [1:0] band;
+
+    always @(*) begin
+        if (lo_freq_mhz < 1000)
+            band = 2'd0;
+        else if (lo_freq_mhz < 3000)
+            band = 2'd1;
+        else
+            band = 2'd2;
+    end
+
+    //-----------------------------
+    // RSSI ACCUMULATOR
+    //-----------------------------
+    reg [15:0] rssi_accum;
+    reg [6:0]  sample_cnt;
+    wire       accum_done;
+
+    assign accum_done = (sample_cnt == 7'd64);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            rssi_accum <= 0;
+            sample_cnt <= 0;
+        end else if (state == ACCUM) begin
+            rssi_accum <= rssi_accum + rssi_in;
+            sample_cnt <= sample_cnt + 1;
+        end else begin
+            rssi_accum <= 0;
+            sample_cnt <= 0;
+        end
+    end
+
+    wire [15:0] avg_rssi = rssi_accum >> 6;
+
+    //-----------------------------
+    // LUT MEMORY (Multi-Band)
+    //-----------------------------
+    reg [15:0] lut_mem [0:2][0:255];
+
+    wire [15:0] lut_value;
+    assign lut_value = lut_mem[band][gain_step_index];
+
+    //-----------------------------
+    // FSM
+    //-----------------------------
+    localparam IDLE       = 3'd0,
+               ACCUM      = 3'd1,
+               COMPUTE    = 3'd2,
+               LUT_UPDATE = 3'd3,
+               SPI_WRITE  = 3'd4,
+               DONE       = 3'd5;
+
+    reg [2:0] state;
+    reg [15:0] correction;
+
+    //-----------------------------
+    // SPI Interface Signals
+    //-----------------------------
+    reg spi_start;
+    wire spi_done;
+
+    spi_master spi_inst (
+        .clk(clk),
+        .rst(rst),
+        .start(spi_start),
+        .data_in({8'h0A, correction}), // Example register addr
+        .spi_cs(spi_cs),
+        .spi_clk(spi_clk),
+        .spi_mosi(spi_mosi),
+        .done(spi_done)
+    );
+
+    //-----------------------------
+    // FSM Logic
+    //-----------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= IDLE;
+            calib_done <= 0;
+            spi_start <= 0;
+        end else begin
+            case (state)
+
+                IDLE: begin
+                    calib_done <= 0;
+                    if (start)
+                        state <= ACCUM;
+                end
+
+                ACCUM:
+                    if (accum_done)
+                        state <= COMPUTE;
+
+                COMPUTE: begin
+                    correction <= TARGET_RSSI - 
+                                  (avg_rssi + lut_value);
+                    state <= LUT_UPDATE;
+                end
+
+                LUT_UPDATE: begin
+                    lut_mem[band][gain_step_index] <= correction;
+                    state <= SPI_WRITE;
+                end
+
+                SPI_WRITE: begin
+                    spi_start <= 1;
+                    if (spi_done) begin
+                        spi_start <= 0;
+                        state <= DONE;
+                    end
+                end
+
+                DONE: begin
+                    calib_done <= 1;
+                    state <= IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
+
+
+module spi_master(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+    input  wire [23:0] data_in,
+    output reg  spi_cs,
+    output reg  spi_clk,
+    output reg  spi_mosi,
+    output reg  done
+);
+
+    reg [4:0] bit_cnt;
+    reg [23:0] shift_reg;
+    reg active;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            spi_cs <= 1;
+            spi_clk <= 0;
+            done <= 0;
+            active <= 0;
+        end else begin
+            if (start && !active) begin
+                active <= 1;
+                spi_cs <= 0;
+                shift_reg <= data_in;
+                bit_cnt <= 24;
+                done <= 0;
+            end
+
+            if (active) begin
+                spi_clk <= ~spi_clk;
+                if (spi_clk) begin
+                    spi_mosi <= shift_reg[23];
+                    shift_reg <= shift_reg << 1;
+                    bit_cnt <= bit_cnt - 1;
+                end
+
+                if (bit_cnt == 0) begin
+                    active <= 0;
+                    spi_cs <= 1;
+                    done <= 1;
+                end
+            end else begin
+                done <= 0;
+            end
+        end
+    end
+endmodule
+
+
+SPI Master Model (Synthesizable)
+
+`timescale 1ns/1ps
+
+module tb_rssi_gain_calib_top;
+
+    reg clk = 0;
+    always #5 clk = ~clk;
+
+    reg rst;
+    reg start;
+    reg [15:0] lo_freq;
+    reg [7:0] gain_index;
+    reg [15:0] rssi_in;
+
+    wire spi_cs, spi_clk, spi_mosi;
+    wire calib_done;
+
+    rssi_gain_calib_top dut (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .lo_freq_mhz(lo_freq),
+        .gain_step_index(gain_index),
+        .rssi_in(rssi_in),
+        .spi_cs(spi_cs),
+        .spi_clk(spi_clk),
+        .spi_mosi(spi_mosi),
+        .calib_done(calib_done)
+    );
+
+    integer i;
+
+    initial begin
+        rst = 1;
+        start = 0;
+        #20 rst = 0;
+
+        // Test Multi-band cases
+        repeat (3) begin
+
+            case ($random % 3)
+                0: lo_freq = 800;
+                1: lo_freq = 2400;
+                2: lo_freq = 3500;
+            endcase
+
+            gain_index = $random % 64;
+
+            start = 1;
+            #10 start = 0;
+
+            for (i=0; i<70; i=i+1) begin
+                rssi_in = 900 + ($random % 100);
+                #10;
+            end
+
+            wait(calib_done);
+            $display("Band=%d Gain=%d Calibration Complete",
+                     dut.band, gain_index);
+            #50;
+        end
+
+        $finish;
+    end
+endmodule
+
+
+              +----------------------+
+              | LO Sweep Counter     |
+              +----------------------+
+                         |
+              +----------------------+
+              | Gain Sweep Counter   |
+              +----------------------+
+                         |
+              +----------------------+
+              | RSSI Accumulator     |
+              +----------------------+
+                         |
+              +----------------------+
+              | Correction Compute   |
+              +----------------------+
+                         |
+              +----------------------+
+              | Calibration Memory   |
+              +----------------------+
+
+`timescale 1ns/1ps
+
+module rssi_calib_sweep #(
+    parameter LO_START_MHZ  = 200,
+    parameter LO_END_MHZ    = 3000,
+    parameter LO_STEP_MHZ   = 200,
+    parameter MAX_GAIN_IDX  = 63,
+    parameter TARGET_RSSI   = 1000
+)(
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        start,
+    input  wire [15:0] rssi_in,
+
+    output reg         sweep_done,
+    output reg [15:0]  current_lo,
+    output reg [7:0]   current_gain
+);
+
+    //---------------------------------------
+    // Derived parameters
+    //---------------------------------------
+    localparam LO_STEPS = ((LO_END_MHZ - LO_START_MHZ)/LO_STEP_MHZ) + 1;
+
+    //---------------------------------------
+    // Calibration memory
+    //---------------------------------------
+    reg [15:0] calib_mem [0:LO_STEPS-1][0:MAX_GAIN_IDX];
+
+    //---------------------------------------
+    // Counters
+    //---------------------------------------
+    reg [15:0] lo_index;
+    reg [7:0]  gain_index;
+
+    //---------------------------------------
+    // RSSI accumulation
+    //---------------------------------------
+    reg [15:0] rssi_accum;
+    reg [6:0]  sample_cnt;
+
+    wire accum_done = (sample_cnt == 7'd64);
+    wire [15:0] avg_rssi = rssi_accum >> 6;
+
+    //---------------------------------------
+    // FSM
+    //---------------------------------------
+    localparam IDLE    = 3'd0,
+               ACCUM   = 3'd1,
+               COMPUTE = 3'd2,
+               STORE   = 3'd3,
+               NEXT    = 3'd4,
+               DONE    = 3'd5;
+
+    reg [2:0] state;
+
+    //---------------------------------------
+    // MAIN FSM
+    //---------------------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= IDLE;
+            lo_index <= 0;
+            gain_index <= 0;
+            sweep_done <= 0;
+            rssi_accum <= 0;
+            sample_cnt <= 0;
+        end else begin
+            case (state)
+
+                IDLE: begin
+                    sweep_done <= 0;
+                    if (start) begin
+                        lo_index <= 0;
+                        gain_index <= 0;
+                        state <= ACCUM;
+                    end
+                end
+
+                ACCUM: begin
+                    rssi_accum <= rssi_accum + rssi_in;
+                    sample_cnt <= sample_cnt + 1;
+
+                    if (accum_done)
+                        state <= COMPUTE;
+                end
+
+                COMPUTE: begin
+                    calib_mem[lo_index][gain_index] <= 
+                        TARGET_RSSI - avg_rssi;
+                    state <= STORE;
+                end
+
+                STORE: begin
+                    rssi_accum <= 0;
+                    sample_cnt <= 0;
+                    state <= NEXT;
+                end
+
+                NEXT: begin
+                    if (gain_index < MAX_GAIN_IDX) begin
+                        gain_index <= gain_index + 1;
+                        state <= ACCUM;
+                    end else begin
+                        gain_index <= 0;
+
+                        if (lo_index < LO_STEPS-1) begin
+                            lo_index <= lo_index + 1;
+                            state <= ACCUM;
+                        end else
+                            state <= DONE;
+                    end
+                end
+
+                DONE: begin
+                    sweep_done <= 1;
+                    state <= IDLE;
+                end
+
+            endcase
+        end
+    end
+
+    //---------------------------------------
+    // Current LO + Gain Output
+    //---------------------------------------
+    always @(*) begin
+        current_lo   = LO_START_MHZ + lo_index*LO_STEP_MHZ;
+        current_gain = gain_index;
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_rssi_calib_sweep;
+
+    reg clk = 0;
+    always #5 clk = ~clk;
+
+    reg rst;
+    reg start;
+    reg [15:0] rssi_in;
+
+    wire sweep_done;
+    wire [15:0] current_lo;
+    wire [7:0]  current_gain;
+
+    rssi_calib_sweep dut (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .rssi_in(rssi_in),
+        .sweep_done(sweep_done),
+        .current_lo(current_lo),
+        .current_gain(current_gain)
+    );
+
+    integer i;
+
+    initial begin
+        rst = 1;
+        start = 0;
+        #20 rst = 0;
+
+        start = 1;
+        #10 start = 0;
+
+        // Feed RSSI values continuously
+        while (!sweep_done) begin
+            rssi_in = 850 + ($random % 200);
+            #10;
+        end
+
+        $display("Full LO + Gain Sweep Completed");
+        $finish;
+    end
+
+endmodule
+
+`timescale 1ns/1ps
+
+module signed_rssi_gain_calib #(
+    parameter signed TARGET_RSSI = 16'sd1000
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+
+    input  wire [15:0] lo_freq_mhz,
+    input  wire [7:0]  gain_step_index,
+    input  wire signed [15:0] rssi_in,
+
+    output reg  signed [15:0] avg_rssi,
+    output reg  signed [15:0] correction,
+    output reg  done
+);
+
+    //---------------------------------------
+    // Internal registers
+    //---------------------------------------
+    reg signed [31:0] rssi_sum;   // Wider to prevent overflow
+    reg [6:0] sample_count;
+    reg running;
+
+    //---------------------------------------
+    // LO-based small offset model
+    //---------------------------------------
+    function signed [15:0] lo_offset;
+        input [15:0] lo;
+        begin
+            if (lo < 1000)
+                lo_offset = -10;
+            else if (lo < 2500)
+                lo_offset = 5;
+            else
+                lo_offset = 15;
+        end
+    endfunction
+
+    //---------------------------------------
+    // Main Logic
+    //---------------------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            rssi_sum     <= 0;
+            sample_count <= 0;
+            avg_rssi     <= 0;
+            correction   <= 0;
+            running      <= 0;
+            done         <= 0;
+        end 
+        else begin
+
+            if (start) begin
+                rssi_sum     <= 0;
+                sample_count <= 0;
+                running      <= 1;
+                done         <= 0;
+            end
+
+            if (running) begin
+                rssi_sum     <= rssi_sum + rssi_in;
+                sample_count <= sample_count + 1;
+
+                if (sample_count == 7'd63) begin
+                    running  <= 0;
+
+                    avg_rssi <= rssi_sum >>> 6;   // signed divide by 64
+
+                    correction <= TARGET_RSSI
+                                  - (rssi_sum >>> 6)
+                                  - lo_offset(lo_freq_mhz);
+
+                    done <= 1;
+                end
+            end
+        end
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_signed_rssi_gain_calib;
+
+    reg clk = 0;
+    always #5 clk = ~clk;
+
+    reg rst;
+    reg start;
+    reg [15:0] lo_freq;
+    reg [7:0]  gain_step;
+    reg signed [15:0] rssi_in;
+
+    wire signed [15:0] avg_rssi;
+    wire signed [15:0] correction;
+    wire done;
+
+    signed_rssi_gain_calib dut (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .lo_freq_mhz(lo_freq),
+        .gain_step_index(gain_step),
+        .rssi_in(rssi_in),
+        .avg_rssi(avg_rssi),
+        .correction(correction),
+        .done(done)
+    );
+
+    integer i;
+
+    task run_test;
+        input signed [15:0] rssi_value;
+        input [15:0] lo_value;
+        begin
+            lo_freq = lo_value;
+
+            start = 1; #10; start = 0;
+
+            for (i=0; i<64; i=i+1) begin
+                rssi_in = rssi_value;
+                #10;
+            end
+
+            wait(done);
+
+            $display("\nLO = %0d MHz", lo_freq);
+            $display("Input RSSI = %0d", rssi_value);
+            $display("Average    = %0d", avg_rssi);
+            $display("Correction = %0d", correction);
+        end
+    endtask
+
+    initial begin
+
+        rst = 1; start = 0;
+        #20 rst = 0;
+
+        // Below target
+        run_test(900, 800);
+
+        // Equal to target
+        run_test(1000, 1500);
+
+        // Above target (negative correction)
+        run_test(1100, 2800);
+
+        // Negative RSSI test (dB-style)
+        run_test(-50, 2400);
+
+        #100;
+        $finish;
+    end
+
+endmodule
+
+`timescale 1ns/1ps
+
+module lo_sweep_rssi_calib #(
+    parameter signed TARGET_RSSI = 16'sd1000,
+    parameter LO_START = 200,
+    parameter LO_END   = 3000,
+    parameter LO_STEP  = 200
+)(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+    input  wire signed [15:0] rssi_in,
+
+    output reg [15:0] current_lo,
+    output reg sweep_done
+);
+
+    //--------------------------------------
+    // Derived Parameter
+    //--------------------------------------
+    localparam LO_STEPS = ((LO_END-LO_START)/LO_STEP)+1;
+
+    //--------------------------------------
+    // Memory to store correction per LO
+    //--------------------------------------
+    reg signed [15:0] correction_mem [0:LO_STEPS-1];
+
+    //--------------------------------------
+    // Internal Registers
+    //--------------------------------------
+    reg [7:0] lo_index;
+    reg signed [31:0] rssi_sum;
+    reg [6:0] sample_cnt;
+    reg signed [15:0] avg_rssi;
+    reg signed [15:0] correction;
+
+    //--------------------------------------
+    // FSM States
+    //--------------------------------------
+    localparam IDLE    = 2'd0,
+               ACCUM   = 2'd1,
+               COMPUTE = 2'd2,
+               NEXT_LO = 2'd3;
+
+    reg [1:0] state;
+
+    //--------------------------------------
+    // Main FSM
+    //--------------------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state       <= IDLE;
+            lo_index    <= 0;
+            rssi_sum    <= 0;
+            sample_cnt  <= 0;
+            sweep_done  <= 0;
+            current_lo  <= LO_START;
+        end
+        else begin
+            case (state)
+
+                //----------------------------------
+                IDLE:
+                //----------------------------------
+                begin
+                    sweep_done <= 0;
+                    if (start) begin
+                        lo_index   <= 0;
+                        current_lo <= LO_START;
+                        state      <= ACCUM;
+                    end
+                end
+
+                //----------------------------------
+                ACCUM:
+                //----------------------------------
+                begin
+                    rssi_sum   <= rssi_sum + rssi_in;
+                    sample_cnt <= sample_cnt + 1;
+
+                    if (sample_cnt == 7'd63)
+                        state <= COMPUTE;
+                end
+
+                //----------------------------------
+                COMPUTE:
+                //----------------------------------
+                begin
+                    avg_rssi  <= rssi_sum >>> 6;
+                    correction <= TARGET_RSSI - (rssi_sum >>> 6);
+
+                    correction_mem[lo_index] <= correction;
+
+                    rssi_sum   <= 0;
+                    sample_cnt <= 0;
+
+                    state <= NEXT_LO;
+                end
+
+                //----------------------------------
+                NEXT_LO:
+                //----------------------------------
+                begin
+                    if (current_lo + LO_STEP <= LO_END) begin
+                        lo_index   <= lo_index + 1;
+                        current_lo <= current_lo + LO_STEP;
+                        state      <= ACCUM;
+                    end
+                    else begin
+                        sweep_done <= 1;
+                        state <= IDLE;
+                    end
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+`timescale 1ns/1ps
+
+module tb_lo_sweep_rssi_calib;
+
+    reg clk = 0;
+    always #5 clk = ~clk;
+
+    reg rst;
+    reg start;
+    reg signed [15:0] rssi_in;
+
+    wire [15:0] current_lo;
+    wire sweep_done;
+
+    lo_sweep_rssi_calib dut (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .rssi_in(rssi_in),
+        .current_lo(current_lo),
+        .sweep_done(sweep_done)
+    );
+
+    initial begin
+        rst = 1;
+        start = 0;
+        rssi_in = 0;
+
+        #20 rst = 0;
+
+        #20 start = 1;
+        #10 start = 0;
+
+        while (!sweep_done) begin
+            rssi_in = 900 + ($random % 200);
+            #10;
+        end
+
+        $display("LO Sweep Completed.");
+        #50;
+        $finish;
+    end
+
+endmodule
+
+
+
+
+
+
+
+
