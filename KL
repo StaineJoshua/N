@@ -1,0 +1,1003 @@
+clc;
+clear;
+close all;
+
+%% ============================================================
+%  RSSI Gain Step Calibration for AD9361
+% =============================================================
+
+%% 1️⃣ USER PARAMETERS
+
+lo_freqs = linspace(200e6, 3e9, 8);     % LO sweep (8 points)
+gain_steps = 0:2:70;                   % Gain step index sweep
+input_power_dBm = -40;                 % Known calibration input
+
+num_lo   = length(lo_freqs);
+num_gain = length(gain_steps);
+
+%% 2️⃣ PRE-ALLOCATE STORAGE
+
+measured_rssi   = zeros(num_lo, num_gain);
+ideal_rssi      = zeros(num_lo, num_gain);
+correction_lut  = zeros(num_lo, num_gain);
+corrected_rssi  = zeros(num_lo, num_gain);
+
+%% 3️⃣ SIMULATED RSSI MEASUREMENT MODEL
+% This models non-ideal AD9361 behavior:
+% - Gain compression
+% - Frequency dependent error
+% - Random noise
+
+for i = 1:num_lo
+    
+    lo = lo_freqs(i);
+    
+    % Frequency dependent error term
+    freq_error = 0.5 * (lo/3e9);   
+    
+    for j = 1:num_gain
+        
+        gain = gain_steps(j);
+        
+        % Ideal RSSI
+        ideal_rssi(i,j) = input_power_dBm + gain;
+        
+        % Non-ideal effects
+        gain_error = 0.02 * gain^1.1;
+        noise = randn * 0.25;
+        
+        % Simulated measured RSSI
+        measured_rssi(i,j) = ideal_rssi(i,j) ...
+                             - gain_error ...
+                             - freq_error ...
+                             + noise;
+        
+        % Compute correction LUT
+        correction_lut(i,j) = ideal_rssi(i,j) ...
+                              - measured_rssi(i,j);
+                          
+        % Apply correction
+        corrected_rssi(i,j) = measured_rssi(i,j) ...
+                              + correction_lut(i,j);
+    end
+end
+
+%% 4️⃣ VISUALIZATION
+
+% ---- Example LO Plot ----
+figure;
+plot(gain_steps, measured_rssi(1,:), 'o-'); hold on;
+plot(gain_steps, corrected_rssi(1,:), 's-');
+plot(gain_steps, ideal_rssi(1,:), '--');
+grid on;
+xlabel('Gain Step Index');
+ylabel('RSSI (dBm)');
+title(['RSSI Calibration @ LO = ' num2str(lo_freqs(1)/1e6) ' MHz']);
+legend('Measured','Corrected','Ideal');
+
+% ---- 2D Calibration Surface ----
+figure;
+surf(gain_steps, lo_freqs/1e6, correction_lut);
+xlabel('Gain Step Index');
+ylabel('LO Frequency (MHz)');
+zlabel('Correction (dB)');
+title('RSSI Gain Step Calibration LUT Surface');
+shading interp;
+colorbar;
+
+%% 5️⃣ OPTIONAL: Polynomial Fit Per LO
+
+poly_order = 3;
+poly_coeff = zeros(num_lo, poly_order+1);
+
+for i = 1:num_lo
+    poly_coeff(i,:) = polyfit(gain_steps, ...
+                              correction_lut(i,:), ...
+                              poly_order);
+end
+
+disp('Polynomial Coefficients per LO Frequency:');
+disp(poly_coeff);
+
+%% 6️⃣ SUMMARY DISPLAY
+
+fprintf('\nCalibration Complete\n');
+fprintf('LO Points: %d\n', num_lo);
+fprintf('Gain Steps: %d\n', num_gain);
+fprintf('LUT Size: %d x %d\n', size(correction_lut,1), size(correction_lut,2));
+
+
+Corrected RSSI = Measured RSSI + LUT(LO, Gain)
+
+
+Corrected_RSSI = Measured_RSSI + Correction_LUT
+
+
+module rssi_gain_calibration
+(
+    input              clk,
+    input              rst,
+    input              start_cal,
+
+    input      [15:0]  lo_freq_mhz,      // 4000–6000
+    input      [5:0]   gain_index,       // 0–63
+    input      signed [15:0] measured_rssi,
+
+    output reg signed [15:0] corrected_rssi,
+    output reg         cal_done
+);
+
+    // -----------------------------
+    // Parameters
+    // -----------------------------
+    parameter INPUT_POWER = -40;   // dBm reference
+
+    // -----------------------------
+    // Internal Signals
+    // -----------------------------
+    reg [1:0] lo_index;
+    reg signed [15:0] ideal_rssi;
+    reg signed [15:0] correction;
+
+    // LUT: 4 LO points × 64 gain steps
+    reg signed [15:0] correction_lut [0:3][0:63];
+
+    integer i,j;
+
+    // -----------------------------
+    // LO Frequency Mapping
+    // -----------------------------
+    always @(*) begin
+        if (lo_freq_mhz < 4500)
+            lo_index = 2'd0;
+        else if (lo_freq_mhz < 5000)
+            lo_index = 2'd1;
+        else if (lo_freq_mhz < 5500)
+            lo_index = 2'd2;
+        else
+            lo_index = 2'd3;
+    end
+
+    // -----------------------------
+    // Calibration Process
+    // -----------------------------
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cal_done <= 0;
+            corrected_rssi <= 0;
+        end
+        else begin
+            if (start_cal) begin
+
+                // Ideal RSSI model
+                ideal_rssi = INPUT_POWER + gain_index;
+
+                // Compute correction
+                correction = ideal_rssi - measured_rssi;
+
+                // Store in LUT
+                correction_lut[lo_index][gain_index] <= correction;
+
+                cal_done <= 1;
+            end
+            else begin
+                cal_done <= 0;
+            end
+
+            // Runtime correction
+            corrected_rssi <= measured_rssi + 
+                              correction_lut[lo_index][gain_index];
+        end
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_rssi_gain_calibration;
+
+    reg clk;
+    reg rst;
+    reg start_cal;
+    reg [15:0] lo_freq_mhz;
+    reg [5:0] gain_index;
+    reg signed [15:0] measured_rssi;
+
+    wire signed [15:0] corrected_rssi;
+    wire cal_done;
+
+    rssi_gain_calibration uut (
+        .clk(clk),
+        .rst(rst),
+        .start_cal(start_cal),
+        .lo_freq_mhz(lo_freq_mhz),
+        .gain_index(gain_index),
+        .measured_rssi(measured_rssi),
+        .corrected_rssi(corrected_rssi),
+        .cal_done(cal_done)
+    );
+
+    // Clock generation
+    always #5 clk = ~clk;
+
+    initial begin
+        clk = 0;
+        rst = 1;
+        start_cal = 0;
+
+        #20 rst = 0;
+
+        // Test Case 1: 4200 MHz
+        lo_freq_mhz = 4200;
+        gain_index = 20;
+        measured_rssi = -25;   // simulate error
+        start_cal = 1;
+        #10 start_cal = 0;
+
+        #20;
+
+        // Test Case 2: 5200 MHz
+        lo_freq_mhz = 5200;
+        gain_index = 35;
+        measured_rssi = -10;
+        start_cal = 1;
+        #10 start_cal = 0;
+
+        #50;
+
+        $stop;
+    end
+
+endmodule
+
+
+
+
+
+LO frequency (4000–6000 MHz)
+    ↓
+Gain Step Index
+    ↓
+Read measured RSSI
+    ↓
+Compute correction
+    ↓
+Store in LUT
+
+
+module rssi_gain_calibration_fsm
+(
+    input               clk,
+    input               rst,
+
+    // Control
+    input               start_cal,        // Start calibration pulse
+
+    // Inputs from AD9361
+    input       [15:0]  lo_freq_mhz,      // 4000–6000 MHz
+    input       [5:0]   gain_index,       // 0–63
+    input signed [15:0] measured_rssi,    // RSSI from hardware
+
+    // Outputs
+    output reg signed [15:0] corrected_rssi,
+    output reg          cal_done
+);
+
+    // ==========================================================
+    // PARAMETERS
+    // ==========================================================
+    parameter INPUT_POWER = -40;   // Known calibration input (dBm)
+
+    // ==========================================================
+    // STATE MACHINE
+    // ==========================================================
+    localparam IDLE      = 2'd0;
+    localparam CALC      = 2'd1;
+    localparam STORE     = 2'd2;
+    localparam COMPLETE  = 2'd3;
+
+    reg [1:0] state, next_state;
+
+    // ==========================================================
+    // LO Frequency Band Mapping (4–6 GHz)
+    // ==========================================================
+    reg [1:0] lo_index;
+
+    always @(*) begin
+        if (lo_freq_mhz < 4500)
+            lo_index = 2'd0;  // 4000–4499
+        else if (lo_freq_mhz < 5000)
+            lo_index = 2'd1;  // 4500–4999
+        else if (lo_freq_mhz < 5500)
+            lo_index = 2'd2;  // 5000–5499
+        else
+            lo_index = 2'd3;  // 5500–6000
+    end
+
+    // ==========================================================
+    // LUT MEMORY (4 LO bands × 64 gain steps)
+    // ==========================================================
+    reg signed [15:0] correction_lut [0:3][0:63];
+
+    reg signed [15:0] ideal_rssi;
+    reg signed [15:0] correction;
+
+    // ==========================================================
+    // STATE TRANSITION LOGIC
+    // ==========================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    always @(*) begin
+        case(state)
+            IDLE:
+                next_state = start_cal ? CALC : IDLE;
+
+            CALC:
+                next_state = STORE;
+
+            STORE:
+                next_state = COMPLETE;
+
+            COMPLETE:
+                next_state = IDLE;
+
+            default:
+                next_state = IDLE;
+        endcase
+    end
+
+    // ==========================================================
+    // OUTPUT & DATA PATH LOGIC
+    // ==========================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cal_done <= 0;
+            corrected_rssi <= 0;
+        end
+        else begin
+            case(state)
+
+                IDLE: begin
+                    cal_done <= 0;
+
+                    // Runtime correction always active
+                    corrected_rssi <= measured_rssi +
+                        correction_lut[lo_index][gain_index];
+                end
+
+                CALC: begin
+                    // Compute ideal RSSI
+                    ideal_rssi <= INPUT_POWER + gain_index;
+
+                    // Compute correction
+                    correction <= (INPUT_POWER + gain_index)
+                                   - measured_rssi;
+                end
+
+                STORE: begin
+                    // Store computed correction in LUT
+                    correction_lut[lo_index][gain_index] <= correction;
+                end
+
+                COMPLETE: begin
+                    cal_done <= 1;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+
+module rssi_gain_calibration_fsm
+(
+    input               clk,
+    input               rst,
+
+    // Control
+    input               start_cal,        // Start calibration pulse
+
+    // Inputs from AD9361
+    input       [15:0]  lo_freq_mhz,      // 4000–6000 MHz
+    input       [5:0]   gain_index,       // 0–63
+    input signed [15:0] measured_rssi,    // RSSI from hardware
+
+    // Outputs
+    output reg signed [15:0] corrected_rssi,
+    output reg          cal_done
+);
+
+    // ==========================================================
+    // PARAMETERS
+    // ==========================================================
+    parameter INPUT_POWER = -40;   // Known calibration input (dBm)
+
+    // ==========================================================
+    // STATE MACHINE
+    // ==========================================================
+    localparam IDLE      = 2'd0;
+    localparam CALC      = 2'd1;
+    localparam STORE     = 2'd2;
+    localparam COMPLETE  = 2'd3;
+
+    reg [1:0] state, next_state;
+
+    // ==========================================================
+    // LO Frequency Band Mapping (4–6 GHz)
+    // ==========================================================
+    reg [1:0] lo_index;
+
+    always @(*) begin
+        if (lo_freq_mhz < 4500)
+            lo_index = 2'd0;  // 4000–4499
+        else if (lo_freq_mhz < 5000)
+            lo_index = 2'd1;  // 4500–4999
+        else if (lo_freq_mhz < 5500)
+            lo_index = 2'd2;  // 5000–5499
+        else
+            lo_index = 2'd3;  // 5500–6000
+    end
+
+    // ==========================================================
+    // LUT MEMORY (4 LO bands × 64 gain steps)
+    // ==========================================================
+    reg signed [15:0] correction_lut [0:3][0:63];
+
+    reg signed [15:0] ideal_rssi;
+    reg signed [15:0] correction;
+
+    // ==========================================================
+    // STATE TRANSITION LOGIC
+    // ==========================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    always @(*) begin
+        case(state)
+            IDLE:
+                next_state = start_cal ? CALC : IDLE;
+
+            CALC:
+                next_state = STORE;
+
+            STORE:
+                next_state = COMPLETE;
+
+            COMPLETE:
+                next_state = IDLE;
+
+            default:
+                next_state = IDLE;
+        endcase
+    end
+
+    // ==========================================================
+    // OUTPUT & DATA PATH LOGIC
+    // ==========================================================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            cal_done <= 0;
+            corrected_rssi <= 0;
+        end
+        else begin
+            case(state)
+
+                IDLE: begin
+                    cal_done <= 0;
+
+                    // Runtime correction always active
+                    corrected_rssi <= measured_rssi +
+                        correction_lut[lo_index][gain_index];
+                end
+
+                CALC: begin
+                    // Compute ideal RSSI
+                    ideal_rssi <= INPUT_POWER + gain_index;
+
+                    // Compute correction
+                    correction <= (INPUT_POWER + gain_index)
+                                   - measured_rssi;
+                end
+
+                STORE: begin
+                    // Store computed correction in LUT
+                    correction_lut[lo_index][gain_index] <= correction;
+                end
+
+                COMPLETE: begin
+                    cal_done <= 1;
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+
+
+
+
+
+
+
+
+
+module rssi_gain_calibration_visual
+(
+    input               clk,
+    input               rst,
+    input               start_cal,
+
+    input       [15:0]  lo_freq_mhz,
+    input       [5:0]   gain_index,
+    input signed [15:0] measured_rssi,
+
+    output reg signed [15:0] corrected_rssi,
+
+    // ===== Debug / Visualization Signals =====
+    output reg [1:0]    state_out,
+    output reg signed [15:0] ideal_rssi_out,
+    output reg signed [15:0] correction_out,
+    output reg          lut_write_en,
+    output reg          cal_done
+);
+
+    parameter INPUT_POWER = -40;
+
+    // =========================
+    // FSM STATES
+    // =========================
+    localparam IDLE     = 2'd0;
+    localparam CALC     = 2'd1;
+    localparam STORE    = 2'd2;
+    localparam COMPLETE = 2'd3;
+
+    reg [1:0] state, next_state;
+
+    // =========================
+    // LO Band Mapping (4–6 GHz)
+    // =========================
+    reg [1:0] lo_index;
+
+    always @(*) begin
+        if (lo_freq_mhz < 4500)
+            lo_index = 2'd0;
+        else if (lo_freq_mhz < 5000)
+            lo_index = 2'd1;
+        else if (lo_freq_mhz < 5500)
+            lo_index = 2'd2;
+        else
+            lo_index = 2'd3;
+    end
+
+    // =========================
+    // LUT Memory
+    // =========================
+    reg signed [15:0] correction_lut [0:3][0:63];
+
+    // =========================
+    // FSM Sequential
+    // =========================
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    // =========================
+    // FSM Combinational
+    // =========================
+    always @(*) begin
+        case(state)
+            IDLE:     next_state = start_cal ? CALC : IDLE;
+            CALC:     next_state = STORE;
+            STORE:    next_state = COMPLETE;
+            COMPLETE: next_state = IDLE;
+            default:  next_state = IDLE;
+        endcase
+    end
+
+    // =========================
+    // Datapath + Visible Signals
+    // =========================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            ideal_rssi_out <= 0;
+            correction_out <= 0;
+            corrected_rssi <= 0;
+            lut_write_en   <= 0;
+            cal_done       <= 0;
+            state_out      <= IDLE;
+        end
+        else begin
+
+            state_out <= state;
+            lut_write_en <= 0;
+            cal_done <= 0;
+
+            case(state)
+
+                IDLE: begin
+                    // Runtime correction visible
+                    corrected_rssi <= measured_rssi +
+                        correction_lut[lo_index][gain_index];
+                end
+
+                CALC: begin
+                    ideal_rssi_out <= INPUT_POWER + gain_index;
+                    correction_out <= (INPUT_POWER + gain_index)
+                                      - measured_rssi;
+                end
+
+                STORE: begin
+                    correction_lut[lo_index][gain_index]
+                        <= correction_out;
+                    lut_write_en <= 1;   // Visible pulse
+                end
+
+                COMPLETE: begin
+                    cal_done <= 1;       // Visible pulse
+                end
+
+            endcase
+        end
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_visual;
+
+    reg clk;
+    reg rst;
+    reg start_cal;
+    reg [15:0] lo_freq_mhz;
+    reg [5:0] gain_index;
+    reg signed [15:0] measured_rssi;
+
+    wire signed [15:0] corrected_rssi;
+    wire [1:0] state_out;
+    wire signed [15:0] ideal_rssi_out;
+    wire signed [15:0] correction_out;
+    wire lut_write_en;
+    wire cal_done;
+
+    rssi_gain_calibration_visual uut (
+        .clk(clk),
+        .rst(rst),
+        .start_cal(start_cal),
+        .lo_freq_mhz(lo_freq_mhz),
+        .gain_index(gain_index),
+        .measured_rssi(measured_rssi),
+        .corrected_rssi(corrected_rssi),
+        .state_out(state_out),
+        .ideal_rssi_out(ideal_rssi_out),
+        .correction_out(correction_out),
+        .lut_write_en(lut_write_en),
+        .cal_done(cal_done)
+    );
+
+    always #5 clk = ~clk;
+
+    initial begin
+        clk = 0;
+        rst = 1;
+        start_cal = 0;
+
+        #20 rst = 0;
+
+        // ===== Test 1 =====
+        lo_freq_mhz = 4200;
+        gain_index = 20;
+        measured_rssi = -25;
+
+        #10 start_cal = 1;
+        #10 start_cal = 0;
+
+        #80;
+
+        // Runtime variation
+        measured_rssi = -27;
+
+        #40;
+
+        $stop;
+    end
+
+endmodule
+
+
+module rssi_auto_calibration
+(
+    input               clk,
+    input               rst,
+    input               start,
+
+    input signed [15:0] measured_rssi,
+
+    output reg  [1:0]   lo_index,
+    output reg  [5:0]   gain_index,
+    output reg signed [15:0] corrected_rssi,
+
+    // Debug visibility
+    output reg  [2:0]   state_out,
+    output reg          lut_write_en,
+    output reg          cal_done
+);
+
+    parameter INPUT_POWER = -40;
+
+    // ==============================
+    // FSM States
+    // ==============================
+    localparam IDLE      = 3'd0;
+    localparam SET_LO    = 3'd1;
+    localparam SET_GAIN  = 3'd2;
+    localparam CALC      = 3'd3;
+    localparam STORE     = 3'd4;
+    localparam NEXT      = 3'd5;
+    localparam DONE      = 3'd6;
+
+    reg [2:0] state, next_state;
+
+    reg signed [15:0] correction;
+    reg signed [15:0] ideal_rssi;
+
+    // LUT memory: 4 × 64
+    reg signed [15:0] correction_lut [0:3][0:63];
+
+    // ==============================
+    // FSM Sequential
+    // ==============================
+    always @(posedge clk or posedge rst)
+        if (rst)
+            state <= IDLE;
+        else
+            state <= next_state;
+
+    // ==============================
+    // FSM Next-State Logic
+    // ==============================
+    always @(*) begin
+        case(state)
+            IDLE:     next_state = start ? SET_LO : IDLE;
+            SET_LO:   next_state = SET_GAIN;
+            SET_GAIN: next_state = CALC;
+            CALC:     next_state = STORE;
+            STORE:    next_state = NEXT;
+            NEXT: begin
+                if (gain_index == 6'd63) begin
+                    if (lo_index == 2'd3)
+                        next_state = DONE;
+                    else
+                        next_state = SET_LO;
+                end
+                else
+                    next_state = SET_GAIN;
+            end
+            DONE:     next_state = IDLE;
+            default:  next_state = IDLE;
+        endcase
+    end
+
+    // ==============================
+    // Datapath
+    // ==============================
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            lo_index <= 0;
+            gain_index <= 0;
+            cal_done <= 0;
+            lut_write_en <= 0;
+            state_out <= IDLE;
+        end
+        else begin
+            state_out <= state;
+            lut_write_en <= 0;
+            cal_done <= 0;
+
+            case(state)
+
+                IDLE: begin
+                    lo_index <= 0;
+                    gain_index <= 0;
+                end
+
+                SET_LO: begin
+                    gain_index <= 0;
+                end
+
+                SET_GAIN: begin
+                    // Gain already set
+                end
+
+                CALC: begin
+                    ideal_rssi <= INPUT_POWER + gain_index;
+                    correction <= (INPUT_POWER + gain_index)
+                                   - measured_rssi;
+                end
+
+                STORE: begin
+                    correction_lut[lo_index][gain_index]
+                        <= correction;
+                    lut_write_en <= 1;
+                end
+
+                NEXT: begin
+                    if (gain_index == 6'd63) begin
+                        gain_index <= 0;
+                        lo_index <= lo_index + 1;
+                    end
+                    else begin
+                        gain_index <= gain_index + 1;
+                    end
+                end
+
+                DONE: begin
+                    cal_done <= 1;
+                end
+
+            endcase
+
+            // Runtime correction always available
+            corrected_rssi <= measured_rssi +
+                              correction_lut[lo_index][gain_index];
+        end
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_auto;
+
+    reg clk;
+    reg rst;
+    reg start;
+    reg signed [15:0] measured_rssi;
+
+    wire [1:0] lo_index;
+    wire [5:0] gain_index;
+    wire [2:0] state_out;
+    wire lut_write_en;
+    wire cal_done;
+
+    rssi_auto_calibration uut(
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .measured_rssi(measured_rssi),
+        .lo_index(lo_index),
+        .gain_index(gain_index),
+        .state_out(state_out),
+        .lut_write_en(lut_write_en),
+        .cal_done(cal_done)
+    );
+
+    always #5 clk = ~clk;
+
+    initial begin
+        clk = 0;
+        rst = 1;
+        start = 0;
+        measured_rssi = -30;
+
+        #20 rst = 0;
+        #10 start = 1;
+        #10 start = 0;
+
+        #5000;
+
+        $stop;
+    end
+
+endmodule
+
+
+clc;
+clear;
+close all;
+
+%% ============================================================
+% Automatic RSSI Gain Step Calibration for AD9361
+% LO Range: 4000–6000 MHz
+% Gain Index: 0–63
+% ============================================================
+
+%% 1️⃣ PARAMETERS
+
+lo_bands = linspace(4000e6,6000e6,4);   % 4 LO bands
+gain_steps = 0:63;                     % Gain sweep
+input_power_dBm = -40;                  % Known calibration input
+
+num_lo = length(lo_bands);
+num_gain = length(gain_steps);
+
+%% 2️⃣ STORAGE
+
+measured_rssi  = zeros(num_lo, num_gain);
+ideal_rssi     = zeros(num_lo, num_gain);
+correction_lut = zeros(num_lo, num_gain);
+corrected_rssi = zeros(num_lo, num_gain);
+
+%% 3️⃣ AUTOMATIC SWEEP CALIBRATION
+
+fprintf("Starting Automatic Sweep Calibration...\n");
+
+for lo_idx = 1:num_lo
+    
+    lo = lo_bands(lo_idx);
+    
+    % Frequency dependent non-linearity model
+    freq_error = 0.8 * (lo/6e9);  
+    
+    for gain_idx = 1:num_gain
+        
+        gain = gain_steps(gain_idx);
+        
+        % ---- Ideal RSSI ----
+        ideal_rssi(lo_idx,gain_idx) = input_power_dBm + gain;
+        
+        % ---- Simulated Measured RSSI ----
+        gain_error = 0.03 * gain^1.1;      % gain compression
+        noise = randn * 0.2;               % measurement noise
+        
+        measured_rssi(lo_idx,gain_idx) = ...
+            ideal_rssi(lo_idx,gain_idx) ...
+            - gain_error ...
+            - freq_error ...
+            + noise;
+        
+        % ---- Compute Correction ----
+        correction_lut(lo_idx,gain_idx) = ...
+            ideal_rssi(lo_idx,gain_idx) ...
+            - measured_rssi(lo_idx,gain_idx);
+        
+        % ---- Apply Correction ----
+        corrected_rssi(lo_idx,gain_idx) = ...
+            measured_rssi(lo_idx,gain_idx) ...
+            + correction_lut(lo_idx,gain_idx);
+        
+    end
+    
+    fprintf("LO Band %d Completed\n", lo_idx);
+end
+
+fprintf("Calibration Completed!\n");
+
+
+figure;
+plot(gain_steps, measured_rssi(1,:), 'o-'); hold on;
+plot(gain_steps, corrected_rssi(1,:), 's-');
+plot(gain_steps, ideal_rssi(1,:), '--');
+grid on;
+xlabel('Gain Index');
+ylabel('RSSI (dBm)');
+title('RSSI Calibration @ LO Band 1');
+legend('Measured','Corrected','Ideal');
+
+
+figure;
+surf(gain_steps, lo_bands/1e6, correction_lut);
+xlabel('Gain Index');
+ylabel('LO Frequency (MHz)');
+zlabel('Correction (dB)');
+title('Automatic Sweep Calibration LUT');
+shading interp;
+colorbar;
