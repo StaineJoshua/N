@@ -1,0 +1,997 @@
+%% AD9361 RSSI Gain Step Calibration Algorithm
+% =========================================================
+% This script implements RSSI-based gain step calibration for the
+% Analog Devices AD9361 transceiver.
+%
+% Background:
+%   The AD9361 RX path has multiple gain tables (full gain table with
+%   ~73 entries for 2.4 GHz band). Each gain index step should ideally
+%   represent a fixed dB change. Due to component tolerances, actual
+%   gain steps deviate from ideal. This calibration:
+%     1. Sweeps the gain index across the full range
+%     2. Measures RSSI at each gain step
+%     3. Fits a linear model to RSSI vs gain index
+%     4. Computes per-step gain errors
+%     5. Generates a correction LUT (Look-Up Table)
+%
+% Reference: AD9361 Reference Manual (UG-570), Section "RSSI Measurement"
+% =========================================================
+
+clear; clc; close all;
+
+%% ---- Configuration -------------------------------------------------------
+NUM_GAIN_STEPS   = 73;          % AD9361 full gain table entries (0..72)
+NOMINAL_STEP_dB  = 1.0;         % Ideal gain change per step [dB]
+RSSI_AVG_COUNT   = 16;          % Number of RSSI readings to average
+INPUT_POWER_dBm  = -40;         % Known stable input signal power [dBm]
+NOISE_FLOOR_dBm  = -100;        % Approximate receiver noise floor [dBm]
+RSSI_REG_SCALE   = 0.25;        % AD9361 RSSI register LSB = 0.25 dB
+RSSI_OFFSET_dB   = 0;           % System-level RSSI offset (calibrate to 0 first)
+
+%% ---- Simulate AD9361 hardware RSSI readings ------------------------------
+% In a real system, replace this block with actual SPI register reads
+% via libiio / HDL / or instrument driver calls.
+
+rng(42);  % Reproducible noise seed
+gain_index = (0 : NUM_GAIN_STEPS-1)';   % Column vector
+
+% Simulate a realistic non-ideal gain curve:
+%   - True step is NOMINAL ± random error (up to ±0.3 dB)
+%   - Plus a slow roll-off at high gain (AGC saturation effect)
+true_gain_dB = cumsum([0; NOMINAL_STEP_dB * ones(NUM_GAIN_STEPS-1, 1) ...
+                        + 0.3 * randn(NUM_GAIN_STEPS-1, 1)]);
+true_gain_dB = true_gain_dB - true_gain_dB(1);   % Normalize to 0 at index 0
+
+% RSSI observed at each gain step (lower gain → lower RSSI reading)
+signal_dBm   = INPUT_POWER_dBm + true_gain_dB;   % Signal at ADC input
+noise_dBm    = NOISE_FLOOR_dBm + true_gain_dB;   % Noise also amplified
+
+% Convert to linear, add noise uncertainty, back to dB
+rssi_raw_dBm = zeros(NUM_GAIN_STEPS, RSSI_AVG_COUNT);
+for k = 1 : RSSI_AVG_COUNT
+    meas_noise = 0.1 * randn(NUM_GAIN_STEPS, 1);   % ±0.1 dB measurement noise
+    rssi_raw_dBm(:, k) = signal_dBm + meas_noise;
+end
+
+% Average RSSI readings (as AD9361 hardware accumulator does)
+rssi_avg_dBm = mean(rssi_raw_dBm, 2);
+
+% Quantize to AD9361 register resolution (0.25 dB LSB)
+rssi_reg     = round(rssi_avg_dBm / RSSI_REG_SCALE) * RSSI_REG_SCALE;
+
+fprintf('=== AD9361 RSSI Gain Step Calibration ===\n\n');
+fprintf('Input signal  : %.1f dBm\n', INPUT_POWER_dBm);
+fprintf('Gain steps    : %d\n', NUM_GAIN_STEPS);
+fprintf('RSSI averages : %d\n\n', RSSI_AVG_COUNT);
+
+%% ---- Step 1: Linear Fit (Ideal Reference) --------------------------------
+% Fit RSSI vs gain_index → slope should equal NOMINAL_STEP_dB
+p = polyfit(gain_index, rssi_reg, 1);
+rssi_fit_dBm = polyval(p, gain_index);
+
+measured_slope = p(1);
+fprintf('Measured slope : %.4f dB/step  (ideal = %.4f dB/step)\n', ...
+        measured_slope, NOMINAL_STEP_dB);
+fprintf('Fit intercept  : %.2f dBm\n\n', p(2));
+
+%% ---- Step 2: Per-Step Gain Error -----------------------------------------
+% Actual gain at each step from measured RSSI, normalized to step 0
+rssi_gain_est_dB = rssi_reg - rssi_reg(1);
+
+% Ideal gain at each index
+ideal_gain_dB    = gain_index * NOMINAL_STEP_dB;
+
+% Gain step error per index
+gain_error_dB    = rssi_gain_est_dB - ideal_gain_dB;
+
+% Per-step incremental error
+step_error_dB    = diff([0; gain_error_dB]);
+
+%% ---- Step 3: Correction LUT ----------------------------------------------
+% Correction = subtract the cumulative error from the ideal table
+rssi_corrected_dBm = rssi_reg - gain_error_dB;
+
+% Convert correction to AD9361 gain table offset values (integer, 0.25 dB LSB)
+correction_reg = round(-gain_error_dB / RSSI_REG_SCALE);   % Negate: add to table
+
+fprintf('Gain Error Statistics:\n');
+fprintf('  Max  absolute error : %.3f dB (at index %d)\n', ...
+        max(abs(gain_error_dB)), find(abs(gain_error_dB)==max(abs(gain_error_dB)))-1);
+fprintf('  RMS  error          : %.3f dB\n', rms(gain_error_dB));
+fprintf('  Mean step error     : %.4f dB\n\n', mean(abs(step_error_dB)));
+
+%% ---- Step 4: Validation --------------------------------------------------
+% After applying correction, residual error should be < 0.5 dB
+residual_error_dB = rssi_corrected_dBm - (rssi_reg(1) + ideal_gain_dB);
+fprintf('Post-Calibration Residual:\n');
+fprintf('  Max  residual : %.3f dB\n', max(abs(residual_error_dB)));
+fprintf('  RMS  residual : %.3f dB\n\n', rms(residual_error_dB));
+
+%% ---- Step 5: Print Correction LUT ----------------------------------------
+fprintf('%-6s  %-12s  %-12s  %-14s  %-14s\n', ...
+        'Index', 'RSSI(dBm)', 'IdealGain', 'GainError(dB)', 'CorrReg(LSB)');
+fprintf('%s\n', repmat('-', 1, 65));
+for i = 1 : NUM_GAIN_STEPS
+    fprintf('%-6d  %-12.2f  %-12.2f  %-14.3f  %-14d\n', ...
+            gain_index(i), rssi_reg(i), ideal_gain_dB(i), ...
+            gain_error_dB(i), correction_reg(i));
+end
+
+%% ---- Plots ---------------------------------------------------------------
+figure('Name', 'AD9361 RSSI Gain Step Calibration', 'NumberTitle', 'off', ...
+       'Position', [100 100 1200 800]);
+
+% --- Plot 1: RSSI vs Gain Index
+subplot(2,2,1);
+plot(gain_index, rssi_reg,       'b.-', 'LineWidth', 1.2, 'MarkerSize', 6, ...
+     'DisplayName', 'Measured RSSI');
+hold on;
+plot(gain_index, rssi_fit_dBm,   'r--', 'LineWidth', 1.5, 'DisplayName', ...
+     sprintf('Linear Fit (%.3f dB/step)', measured_slope));
+plot(gain_index, rssi_corrected_dBm, 'g-', 'LineWidth', 1.2, ...
+     'DisplayName', 'Corrected RSSI');
+hold off;
+xlabel('Gain Index'); ylabel('RSSI (dBm)');
+title('RSSI vs Gain Index'); legend('Location','northwest'); grid on;
+
+% --- Plot 2: Gain Error per Index
+subplot(2,2,2);
+stem(gain_index, gain_error_dB, 'filled', 'MarkerSize', 3, 'Color', [0.8 0.2 0.2]);
+hold on;
+yline(0, 'k--', 'LineWidth', 1.2);
+yline( 0.5, 'b:', 'LineWidth', 1, 'DisplayName', '±0.5 dB limit');
+yline(-0.5, 'b:', 'LineWidth', 1);
+hold off;
+xlabel('Gain Index'); ylabel('Error (dB)');
+title('Cumulative Gain Error vs Ideal'); grid on;
+legend({'Gain Error', 'Zero', '±0.5 dB Limit'}, 'Location', 'best');
+
+% --- Plot 3: Per-Step Incremental Error
+subplot(2,2,3);
+bar(gain_index(2:end), step_error_dB(2:end), 'FaceColor', [0.2 0.4 0.8]);
+xlabel('Gain Index'); ylabel('Step Error (dB)');
+title('Per-Step Incremental Gain Error'); grid on;
+yline(0, 'r--', 'LineWidth', 1.5);
+
+% --- Plot 4: Residual Error After Calibration
+subplot(2,2,4);
+stem(gain_index, residual_error_dB, 'filled', 'MarkerSize', 3, ...
+     'Color', [0.1 0.6 0.1]);
+hold on;
+yline(0.25,  'r:', 'LineWidth', 1, 'DisplayName', '±0.25 dB (1 LSB)');
+yline(-0.25, 'r:', 'LineWidth', 1);
+yline(0, 'k--', 'LineWidth', 1);
+hold off;
+xlabel('Gain Index'); ylabel('Residual Error (dB)');
+title('Residual Error After Calibration'); grid on;
+legend({'Residual', '±1 LSB Limit'}, 'Location', 'best');
+
+sgtitle('AD9361 RSSI Gain Step Calibration Results', 'FontSize', 14, 'FontWeight', 'bold');
+
+%% ---- Export Correction Table as C-style array ----------------------------
+fprintf('\n\n/* AD9361 RSSI Gain Correction Table (0.25 dB LSB) */\n');
+fprintf('static const int8_t rssi_gain_correction[%d] = {\n    ', NUM_GAIN_STEPS);
+for i = 1 : NUM_GAIN_STEPS
+    fprintf('%3d', correction_reg(i));
+    if i < NUM_GAIN_STEPS
+        fprintf(',');
+        if mod(i, 10) == 0, fprintf('\n    '); end
+    end
+end
+fprintf('\n};\n');
+
+fprintf('\nCalibration complete.\n');
+
+%% ---- Helper Function: Read RSSI from AD9361 (real hardware stub) ---------
+% Replace with actual SPI/libiio implementation for hardware use.
+%
+% function rssi_dBm = ad9361_read_rssi(gain_index, avg_count)
+%   % Write gain index to manual gain control register
+%   spi_write(0x109, gain_index);   % REG_RX1_MANUAL_GAIN_INDEX
+%   spi_write(0x10A, gain_index);   % REG_RX2_MANUAL_GAIN_INDEX
+%
+%   % Trigger RSSI measurement
+%   spi_write(0x150, 0x01);         % REG_RSSI_CONFIG: start one-shot
+%   pause(0.001);                   % Wait for accumulation
+%
+%   % Read RSSI registers (0x1A7..0x1AA for RX1)
+%   msb = spi_read(0x1A7);
+%   lsb = spi_read(0x1A8);
+%   raw = bitshift(msb, 8) + lsb;
+%   rssi_dBm = -raw * 0.25;         % Convert: register * 0.25 dB, negative
+% end
+
+
+
+
+
+
+
+
+
+
+
+%% AD9361 RSSI Gain Step Calibration — LO Frequency & Gain Step Parametric
+% =========================================================================
+% Implements RSSI-based gain step calibration across:
+%   • LO Frequency range : 4000 – 6000 MHz  (4–6 GHz)
+%   • Gain Step Index     : 0 – 72  (AD9361 full gain table, 73 entries)
+%
+% The AD9361 gain table is frequency-dependent — gain steps change with LO.
+% This algorithm builds a 2-D calibration surface:
+%       correction_LUT[lo_freq_idx][gain_step_idx]
+%
+% Algorithm Steps:
+%   1. Sweep LO frequencies (user-defined grid across 4–6 GHz)
+%   2. At each LO, sweep all gain step indices (0–72)
+%   3. Measure & average RSSI at each (LO, gain_idx) operating point
+%   4. Compute per-step gain error vs ideal (1 dB/step)
+%   5. Fit a 2-D correction surface (polynomial in LO freq)
+%   6. Generate correction LUT  [num_lo_points × 73]
+%   7. Export as C 2-D array for firmware use
+%
+% NOTE: LO range is 4000–6000 MHz (the AD9361 supports up to 6 GHz).
+%       "GHz" in the requirement is treated as MHz for AD9361 compliance.
+% =========================================================================
+
+clear; clc; close all;
+
+%% ========== USER PARAMETERS (Edit Here) ==================================
+
+% --- LO Frequency Grid ----------------------------------------------------
+LO_START_MHz     = 4000;        % LO sweep start [MHz]
+LO_STOP_MHz      = 6000;        % LO sweep stop  [MHz]
+LO_STEP_MHz      = 200;         % LO step size   [MHz] — adjust for finer grid
+LO_FREQ_MHz      = (LO_START_MHz : LO_STEP_MHz : LO_STOP_MHz)';  % Column vector
+
+% --- Gain Step Parameters -------------------------------------------------
+GAIN_IDX_START   = 0;           % First gain index to calibrate
+GAIN_IDX_STOP    = 72;          % Last  gain index to calibrate
+GAIN_IDX_STEP    = 1;           % Step between indices (1 = full table)
+gain_index       = (GAIN_IDX_START : GAIN_IDX_STEP : GAIN_IDX_STOP)';
+
+% --- Measurement Settings -------------------------------------------------
+RSSI_AVG_COUNT   = 32;          % RSSI hardware averages per point
+NOMINAL_STEP_dB  = 1.0;         % Ideal gain change per step [dB]
+RSSI_LSB_dB      = 0.25;        % AD9361 RSSI register LSB   [dB]
+INPUT_POWER_dBm  = -40;         % Known CW input signal [dBm]
+
+% --- Derived Dimensions ---------------------------------------------------
+NUM_LO           = numel(LO_FREQ_MHz);
+NUM_GAIN         = numel(gain_index);
+ideal_gain_dB    = gain_index * NOMINAL_STEP_dB;   % Reference gain curve
+
+%% ========== DISPLAY CONFIGURATION ========================================
+fprintf('=============================================================\n');
+fprintf('  AD9361 RSSI Gain Step Calibration  —  Parametric Sweep\n');
+fprintf('=============================================================\n');
+fprintf('  LO Range   : %g – %g MHz  (step %g MHz, %d points)\n', ...
+        LO_START_MHz, LO_STOP_MHz, LO_STEP_MHz, NUM_LO);
+fprintf('  Gain Index : %d – %d  (step %d, %d entries)\n', ...
+        GAIN_IDX_START, GAIN_IDX_STOP, GAIN_IDX_STEP, NUM_GAIN);
+fprintf('  RSSI Avg   : %d samples\n', RSSI_AVG_COUNT);
+fprintf('  Input Power: %.1f dBm\n\n', INPUT_POWER_dBm);
+
+%% ========== STEP 1: HARDWARE SWEEP (Simulated) ===========================
+% --- In real hardware replace ad9361_measure_rssi() stub below -----------
+% rssi_surface[lo_idx, gain_idx] — measured RSSI in dBm
+
+rng(0);  % Fixed seed for reproducibility
+rssi_surface = zeros(NUM_LO, NUM_GAIN);   % Measured RSSI [dBm]
+
+for li = 1 : NUM_LO
+    lo = LO_FREQ_MHz(li);
+
+    % Simulate frequency-dependent gain non-linearity:
+    %   - Higher LO → slightly lower gain (typical RF behaviour)
+    %   - Random per-step errors (component tolerance)
+    freq_rolloff   = -0.003 * (lo - LO_START_MHz);   % dB total rolloff
+    step_errors    = 0.25 * randn(NUM_GAIN-1, 1);     % Per-step random error
+    true_gain      = cumsum([0; NOMINAL_STEP_dB * ones(NUM_GAIN-1,1) ...
+                             + step_errors]) + freq_rolloff * (gain_index/72);
+
+    % RSSI = input + amplified gain
+    signal_dBm = INPUT_POWER_dBm + true_gain;
+
+    % Average RSSI over RSSI_AVG_COUNT samples (simulate hw accumulator)
+    meas = signal_dBm + (0.1/sqrt(RSSI_AVG_COUNT)) * randn(NUM_GAIN, 1);
+
+    % Quantize to RSSI register resolution
+    rssi_surface(li, :) = round(meas / RSSI_LSB_dB) * RSSI_LSB_dB;
+end
+
+%% ========== STEP 2: COMPUTE GAIN ERROR SURFACE ===========================
+% Normalize each LO row to index 0 → gives estimated gain at each step
+gain_est_surface = rssi_surface - rssi_surface(:, 1);   % [NUM_LO × NUM_GAIN]
+
+% Gain error = estimated − ideal
+gain_error_surface = gain_est_surface - ideal_gain_dB';  % broadcast
+
+%% ========== STEP 3: FIT 2-D POLYNOMIAL CORRECTION SURFACE ===============
+% Fit gain_error = P(lo_freq_norm, gain_idx_norm) using degree-3 poly per axis
+% This allows smooth interpolation to arbitrary LO frequencies.
+
+lo_norm    = (LO_FREQ_MHz  - LO_START_MHz) / (LO_STOP_MHz - LO_START_MHz);
+gain_norm  = gain_index / GAIN_IDX_STOP;
+
+% Build Vandermonde-style basis [lo^0..lo^3] x [gain^0..gain^3] → 16 terms
+poly_deg = 3;
+[LO_G, GI_G] = meshgrid(lo_norm, gain_norm);   % Both NUM_GAIN × NUM_LO
+LO_G = LO_G'; GI_G = GI_G';                    % → NUM_LO × NUM_GAIN
+
+PHI = [];   % Design matrix
+for p = 0 : poly_deg
+    for q = 0 : poly_deg
+        PHI = [PHI, reshape(LO_G.^p .* GI_G.^q, [], 1)]; %#ok<AGROW>
+    end
+end
+
+err_vec  = reshape(gain_error_surface, [], 1);
+coeffs   = PHI \ err_vec;                        % Least-squares fit
+err_fit  = reshape(PHI * coeffs, NUM_LO, NUM_GAIN);
+
+fprintf('2-D Polynomial Fit  (degree %d × %d):\n', poly_deg, poly_deg);
+fprintf('  Fit RMS error : %.4f dB\n\n', rms(err_fit(:) - err_vec));
+
+%% ========== STEP 4: CORRECTION LUT =======================================
+% correction_LUT[li, gi] — values to add to RSSI reading to flatten curve
+% Stored as integer multiples of RSSI_LSB_dB (int8, range ±127 × 0.25 dB)
+
+correction_LUT = round(-gain_error_surface / RSSI_LSB_dB);   % In LSB units
+correction_dB  = correction_LUT * RSSI_LSB_dB;               % Back to dB
+
+% Post-calibration residual
+residual_surface = gain_error_surface + correction_dB;
+
+fprintf('Gain Error  (before calibration):\n');
+fprintf('  Peak error : %.3f dB\n',  max(abs(gain_error_surface(:))));
+fprintf('  RMS  error : %.3f dB\n\n', rms(gain_error_surface(:)));
+
+fprintf('Residual    (after  calibration):\n');
+fprintf('  Peak       : %.3f dB\n',  max(abs(residual_surface(:))));
+fprintf('  RMS        : %.3f dB\n\n', rms(residual_surface(:)));
+
+%% ========== STEP 5: PER-LO SUMMARY TABLE =================================
+fprintf('%-12s  %-12s  %-12s  %-12s  %-12s\n', ...
+        'LO(MHz)', 'Slope(dB/st)', 'MaxErr(dB)', 'RMS Err(dB)', 'MaxResid(dB)');
+fprintf('%s\n', repmat('-',1,65));
+for li = 1 : NUM_LO
+    p    = polyfit(gain_index, rssi_surface(li,:)', 1);
+    maxe = max(abs(gain_error_surface(li,:)));
+    rmse = rms(gain_error_surface(li,:));
+    maxr = max(abs(residual_surface(li,:)));
+    fprintf('%-12.0f  %-12.4f  %-12.3f  %-12.3f  %-12.3f\n', ...
+            LO_FREQ_MHz(li), p(1), maxe, rmse, maxr);
+end
+
+%% ========== STEP 6: PLOTS ================================================
+figure('Name','AD9361 RSSI Gain Step Calibration','NumberTitle','off', ...
+       'Position',[60 60 1400 900]);
+
+cmap = parula(NUM_LO);   % Color per LO frequency
+
+% ---- Plot 1: RSSI vs Gain Index (all LO frequencies) --------------------
+ax1 = subplot(2,3,1);
+for li = 1 : NUM_LO
+    plot(gain_index, rssi_surface(li,:), '-', 'Color', cmap(li,:), ...
+         'LineWidth', 1.2); hold on;
+end
+hold off;
+xlabel('Gain Index'); ylabel('RSSI (dBm)');
+title('RSSI vs Gain Index per LO'); grid on;
+colormap(ax1, cmap);
+cb = colorbar; cb.Label.String = 'LO Freq (MHz)';
+clim([LO_START_MHz LO_STOP_MHz]);
+
+% ---- Plot 2: Gain Error Surface (2-D colour map) ------------------------
+subplot(2,3,2);
+imagesc(gain_index, LO_FREQ_MHz, gain_error_surface);
+axis xy; colorbar; colormap(gca, redblue(256));
+xlabel('Gain Index'); ylabel('LO Frequency (MHz)');
+title('Gain Error Surface (dB)  [before cal]');
+clim([-max(abs(gain_error_surface(:))), max(abs(gain_error_surface(:)))]);
+
+% ---- Plot 3: Correction LUT (2-D colour map) ----------------------------
+subplot(2,3,3);
+imagesc(gain_index, LO_FREQ_MHz, correction_LUT);
+axis xy; colorbar; colormap(gca, redblue(256));
+xlabel('Gain Index'); ylabel('LO Frequency (MHz)');
+title('Correction LUT (LSB units, 1 LSB = 0.25 dB)');
+clim([-max(abs(correction_LUT(:))), max(abs(correction_LUT(:)))]);
+
+% ---- Plot 4: Residual Surface after calibration -------------------------
+subplot(2,3,4);
+imagesc(gain_index, LO_FREQ_MHz, residual_surface);
+axis xy; colorbar; colormap(gca, redblue(256));
+xlabel('Gain Index'); ylabel('LO Frequency (MHz)');
+title('Residual Error (dB)  [after cal]');
+lim4 = max(abs(residual_surface(:))+eps);
+clim([-lim4, lim4]);
+
+% ---- Plot 5: Gain Error at selected LO frequencies ----------------------
+subplot(2,3,5);
+lo_sel = round(linspace(1, NUM_LO, min(5,NUM_LO)));
+legs   = {};
+for li = lo_sel
+    plot(gain_index, gain_error_surface(li,:), '-', 'Color', cmap(li,:), ...
+         'LineWidth', 1.5); hold on;
+    legs{end+1} = sprintf('%g MHz', LO_FREQ_MHz(li)); %#ok<SAGROW>
+end
+yline(0,'k--','LineWidth',1.2); yline(0.5,'b:'); yline(-0.5,'b:');
+hold off;
+xlabel('Gain Index'); ylabel('Gain Error (dB)');
+title('Gain Error at Selected LO Frequencies');
+legend(legs,'Location','best','FontSize',7); grid on;
+
+% ---- Plot 6: RMS gain error vs LO frequency (before & after) -----------
+subplot(2,3,6);
+rms_before = arrayfun(@(li) rms(gain_error_surface(li,:)), 1:NUM_LO);
+rms_after  = arrayfun(@(li) rms(residual_surface(li,:)),   1:NUM_LO);
+plot(LO_FREQ_MHz, rms_before, 'r.-', 'LineWidth', 1.5, 'MarkerSize',10, ...
+     'DisplayName','Before Cal'); hold on;
+plot(LO_FREQ_MHz, rms_after,  'g.-', 'LineWidth', 1.5, 'MarkerSize',10, ...
+     'DisplayName','After Cal');
+hold off;
+xlabel('LO Frequency (MHz)'); ylabel('RMS Gain Error (dB)');
+title('RMS Error vs LO Frequency'); legend; grid on;
+
+sgtitle(sprintf('AD9361 RSSI Gain Step Calibration  |  LO: %g–%g MHz  |  Gain Steps: %d–%d', ...
+        LO_START_MHz, LO_STOP_MHz, GAIN_IDX_START, GAIN_IDX_STOP), ...
+        'FontSize',13,'FontWeight','bold');
+
+%% ========== STEP 7: EXPORT CORRECTION LUT AS C ARRAY ====================
+fprintf('\n\n/* ---------------------------------------------------------------\n');
+fprintf(' * AD9361 RSSI Gain Step Correction LUT\n');
+fprintf(' * LO range  : %g – %g MHz  (%d entries, step %g MHz)\n', ...
+        LO_START_MHz, LO_STOP_MHz, NUM_LO, LO_STEP_MHz);
+fprintf(' * Gain index: %d – %d  (%d entries)\n', ...
+        GAIN_IDX_START, GAIN_IDX_STOP, NUM_GAIN);
+fprintf(' * Scale     : 1 LSB = %.2f dB\n', RSSI_LSB_dB);
+fprintf(' * Usage     : correction = rssi_corr_lut[lo_idx][gain_idx]\n');
+fprintf(' *             lo_idx     = (lo_MHz - %g) / %g\n', LO_START_MHz, LO_STEP_MHz);
+fprintf(' *             rssi_corr_dB = correction * %.2f\n', RSSI_LSB_dB);
+fprintf(' * --------------------------------------------------------------- */\n\n');
+fprintf('#define RSSI_CORR_NUM_LO    %d\n', NUM_LO);
+fprintf('#define RSSI_CORR_NUM_GAIN  %d\n', NUM_GAIN);
+fprintf('#define RSSI_CORR_LO_START  %g   /* MHz */\n', LO_START_MHz);
+fprintf('#define RSSI_CORR_LO_STEP   %g   /* MHz */\n\n', LO_STEP_MHz);
+fprintf('static const int8_t rssi_corr_lut[RSSI_CORR_NUM_LO][RSSI_CORR_NUM_GAIN] = {\n');
+for li = 1 : NUM_LO
+    fprintf('    /* LO = %5g MHz */ { ', LO_FREQ_MHz(li));
+    row = correction_LUT(li,:);
+    for gi = 1 : NUM_GAIN
+        fprintf('%4d', row(gi));
+        if gi < NUM_GAIN, fprintf(','); end
+        if mod(gi,10)==0 && gi<NUM_GAIN, fprintf('\n                          '); end
+    end
+    if li < NUM_LO
+        fprintf(' },\n');
+    else
+        fprintf(' }\n');
+    end
+end
+fprintf('};\n\n');
+
+fprintf('/* Runtime lookup function:\n');
+fprintf(' * float ad9361_rssi_correct(uint32_t lo_mhz, uint8_t gain_idx) {\n');
+fprintf(' *     int lo_idx = (lo_mhz - RSSI_CORR_LO_START) / RSSI_CORR_LO_STEP;\n');
+fprintf(' *     if (lo_idx < 0) lo_idx = 0;\n');
+fprintf(' *     if (lo_idx >= RSSI_CORR_NUM_LO) lo_idx = RSSI_CORR_NUM_LO-1;\n');
+fprintf(' *     return rssi_corr_lut[lo_idx][gain_idx] * %.2ff; /* dB */\n', RSSI_LSB_dB);
+fprintf(' * }\n */\n');
+
+fprintf('\nCalibration complete.\n');
+
+%% ========== LOCAL FUNCTION: Red-Blue Colormap ============================
+function cmap = redblue(n)
+% Diverging red-blue colormap centred at white (good for signed error maps)
+    if nargin < 1, n = 256; end
+    h = floor(n/2);
+    r = [linspace(0.2,1,h); linspace(1,1,h)]';
+    g = [linspace(0.2,1,h); linspace(1,0.2,h)]';
+    b = [linspace(1,1,h); linspace(1,0.2,h)]';
+    cmap = [r g b];
+    if mod(n,2)==1
+        cmap = [cmap(1:h,:); 1 1 1; cmap(h+1:end,:)];
+    end
+end
+
+%% ========== HARDWARE STUB: Replace for real AD9361 =======================
+%
+% function rssi_dBm = ad9361_measure_rssi(lo_mhz, gain_idx, avg_count)
+%   % 1. Tune LO
+%   ad9361_set_lo(lo_mhz * 1e6);                 % Set RX LO via SPI/IIO
+%
+%   % 2. Set manual gain
+%   spi_write(0x109, gain_idx);                   % RX1 manual gain index
+%   spi_write(0x10A, gain_idx);                   % RX2 manual gain index
+%   spi_write(0x0FA, 0x00);                       % Force MGC mode
+%
+%   % 3. Configure RSSI measurement
+%   spi_write(0x150, avg_count);                  % Set accumulation count
+%   spi_write(0x151, 0x01);                       % Trigger one-shot
+%   pause(avg_count * 1e-3);                      % Wait for completion
+%
+%   % 4. Read RSSI result registers (RX1: 0x1A7-0x1A8)
+%   msb      = spi_read(0x1A7);
+%   lsb      = spi_read(0x1A8);
+%   raw      = bitshift(msb,8) + lsb;
+%   rssi_dBm = -raw * 0.25;                       % Convert to dBm
+% end
+
+
+
+`timescale 1ns/1ps
+
+module rssi_gain_calibration_ad9361_v2 #
+
+(
+    parameter NUM_LO = 9
+)
+
+(
+    input  wire clk,
+    input  wire rst,
+    input  wire start,
+
+    input  wire signed [15:0] rssi_measured,
+    input  wire signed [15:0] input_power_ref,
+
+    output reg  [3:0]  lo_index,
+    output reg  [5:0]  gain_index,
+
+    output reg  [31:0] lo_frequency_mhz,   // Visible in waveform
+    output reg         cal_done
+);
+
+    //--------------------------------------------------
+    // LO Frequency Table
+    //--------------------------------------------------
+    reg [31:0] lo_table [0:NUM_LO-1];
+
+    initial begin
+        lo_table[0] = 4000;
+        lo_table[1] = 4250;
+        lo_table[2] = 4500;
+        lo_table[3] = 4750;
+        lo_table[4] = 5000;
+        lo_table[5] = 5250;
+        lo_table[6] = 5500;
+        lo_table[7] = 5750;
+        lo_table[8] = 6000;
+    end
+
+    //--------------------------------------------------
+    // LUT Memory
+    //--------------------------------------------------
+    reg signed [15:0] lut [0:NUM_LO-1][0:63];
+
+    //--------------------------------------------------
+    // FSM
+    //--------------------------------------------------
+    localparam IDLE=0, SET_LO=1, SET_GAIN=2, WAIT=3,
+               COMPUTE=4, STORE=5, NEXT_GAIN=6,
+               NEXT_LO=7, DONE=8;
+
+    reg [3:0] state;
+    reg [7:0] settle_cnt;
+    reg signed [15:0] ideal;
+    reg signed [15:0] correction;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= IDLE;
+            lo_index <= 0;
+            gain_index <= 0;
+            cal_done <= 0;
+        end
+        else begin
+            case(state)
+
+            IDLE:
+                if (start) state <= SET_LO;
+
+            SET_LO:
+            begin
+                lo_frequency_mhz <= lo_table[lo_index];
+                gain_index <= 0;
+                state <= SET_GAIN;
+            end
+
+            SET_GAIN:
+            begin
+                settle_cnt <= 0;
+                state <= WAIT;
+            end
+
+            WAIT:
+            begin
+                settle_cnt <= settle_cnt + 1;
+                if (settle_cnt == 40)
+                    state <= COMPUTE;
+            end
+
+            COMPUTE:
+            begin
+                ideal <= input_power_ref + gain_index;
+                correction <= ideal - rssi_measured;
+                state <= STORE;
+            end
+
+            STORE:
+            begin
+                lut[lo_index][gain_index] <= correction;
+                state <= NEXT_GAIN;
+            end
+
+            NEXT_GAIN:
+            begin
+                if (gain_index < 63) begin
+                    gain_index <= gain_index + 1;
+                    state <= SET_GAIN;
+                end
+                else
+                    state <= NEXT_LO;
+            end
+
+            NEXT_LO:
+            begin
+                if (lo_index < NUM_LO-1) begin
+                    lo_index <= lo_index + 1;
+                    state <= SET_LO;
+                end
+                else
+                    state <= DONE;
+            end
+
+            DONE:
+            begin
+                cal_done <= 1;
+                state <= IDLE;
+            end
+
+            endcase
+        end
+    end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_ad9361_v2;
+
+    reg clk=0;
+    always #5 clk=~clk;
+
+    reg rst, start;
+    reg signed [15:0] rssi_measured;
+    reg signed [15:0] input_power_ref;
+
+    wire [3:0] lo_index;
+    wire [5:0] gain_index;
+    wire [31:0] lo_frequency_mhz;
+    wire cal_done;
+
+    rssi_gain_calibration_ad9361_v2 DUT (
+        .clk(clk),
+        .rst(rst),
+        .start(start),
+        .rssi_measured(rssi_measured),
+        .input_power_ref(input_power_ref),
+        .lo_index(lo_index),
+        .gain_index(gain_index),
+        .lo_frequency_mhz(lo_frequency_mhz),
+        .cal_done(cal_done)
+    );
+
+    initial begin
+        rst=1; start=0;
+        input_power_ref=-40;
+
+        #20 rst=0;
+        #20 start=1;
+        #10 start=0;
+    end
+
+    // More realistic RSSI model
+    always @(posedge clk) begin
+        
+        // Gain compression
+        integer gain_error;
+        gain_error = gain_index >> 3;
+
+        // Frequency-dependent variation
+        integer freq_error;
+        freq_error = (lo_frequency_mhz - 4000)/200;
+
+        rssi_measured <= input_power_ref
+                         + gain_index
+                         - gain_error
+                         - freq_error;
+    end
+
+endmodule
+
+
+
+MATLAB
+
+clc;
+clear;
+close all;
+
+%% ============================================================
+% RSSI Gain Step Calibration Model for AD9361
+% LO Range: 4000–6000 MHz (9 test points)
+% Gain Index: 0–63
+% ============================================================
+
+%% 1️⃣ PARAMETERS
+
+lo_frequencies = linspace(4000,6000,9);   % MHz
+gain_index = 0:63;
+input_power_dBm = -40;                     % Calibration reference
+
+num_lo = length(lo_frequencies);
+num_gain = length(gain_index);
+
+%% 2️⃣ STORAGE MATRICES
+
+ideal_rssi      = zeros(num_lo,num_gain);
+measured_rssi   = zeros(num_lo,num_gain);
+correction_lut  = zeros(num_lo,num_gain);
+corrected_rssi  = zeros(num_lo,num_gain);
+
+%% 3️⃣ AUTOMATIC SWEEP CALIBRATION
+
+disp("Starting Automatic Sweep Calibration...")
+
+for lo = 1:num_lo
+    
+    freq = lo_frequencies(lo);
+    
+    % Frequency dependent nonlinearity
+    freq_error = (freq - 4000) / 200; 
+    
+    for g = 1:num_gain
+        
+        gain = gain_index(g);
+        
+        % Ideal RSSI (linear in dB)
+        ideal_rssi(lo,g) = input_power_dBm + gain;
+        
+        % Gain compression model
+        gain_error = gain / 8; 
+        
+        % Random measurement noise
+        noise = randn * 0.2;
+        
+        % Simulated measured RSSI
+        measured_rssi(lo,g) = ideal_rssi(lo,g) ...
+                              - gain_error ...
+                              - freq_error ...
+                              + noise;
+        
+        % Compute correction
+        correction_lut(lo,g) = ...
+            ideal_rssi(lo,g) - measured_rssi(lo,g);
+        
+        % Apply correction
+        corrected_rssi(lo,g) = ...
+            measured_rssi(lo,g) + correction_lut(lo,g);
+        
+    end
+end
+
+disp("Calibration Completed.")
+
+figure;
+plot(gain_index, measured_rssi(1,:), 'r','LineWidth',1.5); hold on;
+plot(gain_index, ideal_rssi(1,:), 'k--','LineWidth',1.5);
+plot(gain_index, corrected_rssi(1,:), 'b','LineWidth',1.5);
+grid on;
+xlabel('Gain Index');
+ylabel('RSSI (dBm)');
+title('RSSI Calibration @ 4000 MHz');
+legend('Measured','Ideal','Corrected');
+
+
+figure;
+surf(gain_index, lo_frequencies, correction_lut);
+xlabel('Gain Index');
+ylabel('LO Frequency (MHz)');
+zlabel('Correction (dB)');
+title('RSSI Gain Step Correction LUT');
+shading interp;
+colorbar;
+
+
+
+clc;
+clear;
+close all;
+
+%% ============================================================
+% COMPLETE RSSI GAIN STEP CALIBRATION MODEL
+% Device  : AD9361
+% LO Range: 4000–6000 MHz (9 test points)
+% Gain    : 0–63
+% ============================================================
+
+disp("Starting Full RSSI Gain Step Calibration Model...")
+
+%% 1️⃣ PARAMETERS
+
+lo_frequencies = linspace(4000,6000,9);    % MHz
+gain_index     = 0:63;                    % Gain steps
+input_power_dBm = -40;                    % Calibration reference
+settle_time_us  = 5;                      % assumed settle time
+clock_freq_MHz  = 100;                    % FPGA clock
+
+num_lo   = length(lo_frequencies);
+num_gain = length(gain_index);
+
+%% 2️⃣ PRE-ALLOCATE STORAGE
+
+ideal_rssi     = zeros(num_lo,num_gain);
+measured_rssi  = zeros(num_lo,num_gain);
+correction_lut = zeros(num_lo,num_gain);
+corrected_rssi = zeros(num_lo,num_gain);
+
+%% ============================================================
+% 3️⃣ AUTOMATIC SWEEP CALIBRATION
+% ============================================================
+
+for lo = 1:num_lo
+    
+    freq = lo_frequencies(lo);
+    
+    % Frequency dependent non-linearity model
+    freq_error = (freq - 4000)/200; 
+    
+    for g = 1:num_gain
+        
+        gain = gain_index(g);
+        
+        % Ideal RSSI (dB domain linearity)
+        ideal_rssi(lo,g) = input_power_dBm + gain;
+        
+        % Gain compression model
+        gain_error = gain/8;
+        
+        % Random measurement noise
+        noise = randn * 0.2;
+        
+        % Simulated measured RSSI
+        measured_rssi(lo,g) = ideal_rssi(lo,g) ...
+                              - gain_error ...
+                              - freq_error ...
+                              + noise;
+        
+        % Compute correction
+        correction_lut(lo,g) = ...
+            ideal_rssi(lo,g) - measured_rssi(lo,g);
+        
+        % Apply correction
+        corrected_rssi(lo,g) = ...
+            measured_rssi(lo,g) + correction_lut(lo,g);
+    end
+end
+
+disp("Calibration Completed.")
+
+%% ============================================================
+% 4️⃣ ERROR ANALYSIS
+% ============================================================
+
+error_before = ideal_rssi - measured_rssi;
+error_after  = ideal_rssi - corrected_rssi;
+
+fprintf("Max Error Before Calibration: %.2f dB\n", ...
+        max(abs(error_before(:))));
+fprintf("Max Error After Calibration : %.5f dB\n", ...
+        max(abs(error_after(:))));
+
+%% ============================================================
+% 5️⃣ VISUALIZATION
+% ============================================================
+
+% ---- Single LO Plot ----
+figure;
+plot(gain_index, measured_rssi(1,:), 'r','LineWidth',1.5); hold on;
+plot(gain_index, ideal_rssi(1,:), 'k--','LineWidth',1.5);
+plot(gain_index, corrected_rssi(1,:), 'b','LineWidth',1.5);
+grid on;
+xlabel('Gain Index');
+ylabel('RSSI (dBm)');
+title('RSSI Calibration @ 4000 MHz');
+legend('Measured','Ideal','Corrected');
+
+% ---- 3D LUT Surface ----
+figure;
+surf(gain_index, lo_frequencies, correction_lut);
+xlabel('Gain Index');
+ylabel('LO Frequency (MHz)');
+zlabel('Correction (dB)');
+title('RSSI Gain Step Correction LUT');
+shading interp;
+colorbar;
+
+% ---- Heatmap Before/After ----
+figure;
+subplot(1,2,1);
+imagesc(error_before);
+title('Error Before Calibration');
+xlabel('Gain Index'); ylabel('LO Index');
+colorbar;
+
+subplot(1,2,2);
+imagesc(error_after);
+title('Error After Calibration');
+xlabel('Gain Index'); ylabel('LO Index');
+colorbar;
+
+%% ============================================================
+% 6️⃣ RUNTIME CORRECTION DEMO
+% ============================================================
+
+test_lo   = 5;     % Example LO index
+test_gain = 30;
+
+runtime_measured = measured_rssi(test_lo,test_gain);
+
+runtime_corrected = runtime_measured + ...
+                    correction_lut(test_lo,test_gain);
+
+fprintf("\nRuntime Example:\n");
+fprintf("Measured RSSI  = %.2f dBm\n", runtime_measured);
+fprintf("Corrected RSSI = %.2f dBm\n", runtime_corrected);
+
+%% ============================================================
+% 7️⃣ FIXED-POINT CONVERSION (Q8.8 FORMAT)
+% ============================================================
+
+Q = 8;  % fractional bits
+lut_fixed = round(correction_lut * 2^Q);
+
+fprintf("\nFixed-Point LUT Example (Q8.8):\n");
+disp(lut_fixed(1,1:5));
+
+%% ============================================================
+% 8️⃣ LUT EXPORT FOR FPGA
+% ============================================================
+
+fid = fopen('lut_export_hex.txt','w');
+
+for lo = 1:num_lo
+    for g = 1:num_gain
+        fprintf(fid,"%04X\n", ...
+            typecast(int16(lut_fixed(lo,g)),'uint16'));
+    end
+end
+
+fclose(fid);
+
+disp("LUT exported as lut_export_hex.txt (FPGA ready)");
+
+%% ============================================================
+% 9️⃣ CALIBRATION TIME ESTIMATION
+% ============================================================
+
+total_points = num_lo * num_gain;
+time_per_point_us = settle_time_us;
+total_time_ms = (total_points * time_per_point_us) / 1000;
+
+fprintf("\nTotal Calibration Points: %d\n", total_points);
+fprintf("Estimated Calibration Time: %.2f ms\n", total_time_ms);
+
+%% ============================================================
+% 🔟 MEMORY REQUIREMENT
+% ============================================================
+
+memory_bits = num_lo * num_gain * 16;
+fprintf("Required LUT Memory: %d bits (%.2f KB)\n", ...
+        memory_bits, memory_bits/8/1024);
+
+disp("Full Model Execution Completed Successfully.")
