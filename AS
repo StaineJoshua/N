@@ -1,0 +1,347 @@
+              +------------------+
+LO Sweep ---> | Calibration FSM  |
+              +------------------+
+                       |
+                       v
+               +----------------+
+               | Calibration LUT|
+               +----------------+
+                       |
+                (Real-Time Mode)
+                       v
+                +----------------+
+                | Gain Corrector |
+                +----------------+
+                       |
+                       v
+                   RSSI Model
+'
+
+
+module rssi_gain_system(
+
+    input clk,
+    input rst,
+    input realtime_enable,   // 0 = calibration mode, 1 = real-time mode
+
+    output reg [12:0] lo_freq_mhz,
+    output reg [5:0]  gain_index,
+    output reg done
+);
+
+    parameter LO_START = 4000;
+    parameter LO_END   = 6000;
+    parameter LO_STEP  = 100;
+
+    parameter TARGET_RSSI = 1200;
+    parameter THRESHOLD   = 20;
+
+    reg [2:0] state;
+    reg [4:0] freq_index;
+
+    reg [15:0] rssi_value;
+
+    // 21 entries (4000–6000 in 100 MHz steps)
+    reg [5:0] calibration_lut [0:20];
+
+    // RSSI model instance
+    wire [15:0] rssi_wire;
+    rssi_model model(
+        .lo_freq_mhz(lo_freq_mhz),
+        .gain_index(gain_index),
+        .rssi_out(rssi_wire)
+    );
+
+    localparam CAL_SET   = 0,
+               CAL_ADJ   = 1,
+               CAL_STORE = 2,
+               CAL_NEXT  = 3,
+               RT_LOAD   = 4,
+               RT_CORR   = 5,
+               FINISH    = 6;
+
+    always @(posedge clk or posedge rst) begin
+
+        if (rst) begin
+            lo_freq_mhz <= LO_START;
+            gain_index  <= 0;
+            freq_index  <= 0;
+            done        <= 0;
+            state       <= CAL_SET;
+        end
+
+        else begin
+
+            rssi_value <= rssi_wire;
+
+            case (state)
+
+            // ===============================
+            // CALIBRATION MODE
+            // ===============================
+
+            CAL_SET: begin
+                if (realtime_enable == 0) begin
+                    gain_index <= 0;
+                    state <= CAL_ADJ;
+                end else begin
+                    state <= RT_LOAD;
+                end
+            end
+
+            CAL_ADJ: begin
+                if ( (rssi_value > TARGET_RSSI-THRESHOLD) &&
+                     (rssi_value < TARGET_RSSI+THRESHOLD) ) begin
+                    state <= CAL_STORE;
+                end
+                else if (rssi_value < TARGET_RSSI)
+                    gain_index <= gain_index + 1;
+                else
+                    gain_index <= gain_index - 1;
+            end
+
+            CAL_STORE: begin
+                calibration_lut[freq_index] <= gain_index;
+                state <= CAL_NEXT;
+            end
+
+            CAL_NEXT: begin
+                if (lo_freq_mhz < LO_END) begin
+                    lo_freq_mhz <= lo_freq_mhz + LO_STEP;
+                    freq_index  <= freq_index + 1;
+                    state <= CAL_SET;
+                end else begin
+                    state <= FINISH;
+                end
+            end
+
+            // ===============================
+            // REAL-TIME MODE
+            // ===============================
+
+            RT_LOAD: begin
+                gain_index <= calibration_lut[freq_index];
+                state <= RT_CORR;
+            end
+
+            RT_CORR: begin
+                // Small correction around LUT value
+                if (rssi_value < TARGET_RSSI-THRESHOLD)
+                    gain_index <= gain_index + 1;
+                else if (rssi_value > TARGET_RSSI+THRESHOLD)
+                    gain_index <= gain_index - 1;
+            end
+
+            FINISH: begin
+                done <= 1;
+            end
+
+            endcase
+        end
+    end
+
+endmodule
+
+`timescale 1ns/1ps
+
+module tb_rssi_gain_system;
+
+    reg clk = 0;
+    reg rst = 1;
+    reg realtime_enable = 0;
+
+    wire [12:0] lo_freq_mhz;
+    wire [5:0]  gain_index;
+    wire done;
+
+    rssi_gain_system DUT(
+        .clk(clk),
+        .rst(rst),
+        .realtime_enable(realtime_enable),
+        .lo_freq_mhz(lo_freq_mhz),
+        .gain_index(gain_index),
+        .done(done)
+    );
+
+    always #5 clk = ~clk;
+
+    initial begin
+        $dumpfile("rssi_gain_system.vcd");
+        $dumpvars(0, tb_rssi_gain_system);
+
+        #20 rst = 0;
+
+        // Wait for calibration finish
+        wait(done);
+
+        #50;
+
+        // Switch to real-time mode
+        realtime_enable = 1;
+
+        #1000;
+        $finish;
+    end
+
+    initial begin
+        $monitor("Time=%0t | LO=%0d | Gain=%0d | State=%0d | RSSI=%0d",
+                 $time,
+                 lo_freq_mhz,
+                 gain_index,
+                 DUT.state,
+                 DUT.rssi_value);
+    end
+
+endmodule
+
+clear all;
+clc;
+close all;
+
+%% ================= PARAMETERS =================
+
+LO_START = 4000;
+LO_END   = 6000;
+LO_STEP  = 100;
+
+GAIN_MIN = 0;
+GAIN_MAX = 63;
+
+TARGET_RSSI = 1200;
+THRESHOLD   = 20;
+
+TIMEOUT_MAX = 200;
+
+lo_range = LO_START:LO_STEP:LO_END;
+num_freq = length(lo_range);
+
+calibration_lut = zeros(1,num_freq);
+
+%% ==========================================================
+%% =============== PHASE 1: CALIBRATION =====================
+%% ==========================================================
+
+disp('Starting Calibration Phase...');
+
+for f = 1:num_freq
+
+    lo = lo_range(f);
+    gain = GAIN_MIN;
+    timeout = 0;
+
+    while 1
+
+        timeout = timeout + 1;
+
+        % -------- RSSI MODEL (No Drift) --------
+        rssi = (gain * 18) + ((lo - 4000)/8) + 300;
+
+        % -------- Convergence Check --------
+        if abs(rssi - TARGET_RSSI) <= THRESHOLD
+            break;
+        end
+
+        if timeout > TIMEOUT_MAX
+            disp(['Timeout at LO = ', num2str(lo)]);
+            break;
+        end
+
+        % -------- Gain Adjustment --------
+        if rssi < TARGET_RSSI
+            gain = min(gain+1, GAIN_MAX);
+        else
+            gain = max(gain-1, GAIN_MIN);
+        end
+
+    end
+
+    calibration_lut(f) = gain;
+
+end
+
+disp('Calibration Complete');
+disp('-----------------------------------');
+for i = 1:num_freq
+    fprintf('LO = %d MHz -> Gain = %d\n', ...
+        lo_range(i), calibration_lut(i));
+end
+
+%% ==========================================================
+%% =============== PHASE 2: REAL-TIME MODE ==================
+%% ==========================================================
+
+disp('Starting Real-Time Mode...');
+
+rt_gain_history = [];
+rt_rssi_history = [];
+rt_lo_history   = [];
+
+for f = 1:num_freq
+
+    lo = lo_range(f);
+    gain = calibration_lut(f);
+
+    for t = 1:40   % simulate time steps
+
+        % Add drift + noise
+        drift = 30*sin(0.05*t);
+        noise = randn*10;
+
+        rssi = (gain * 18) + ((lo - 4000)/8) + 300 ...
+               + drift + noise;
+
+        % Real-time correction
+        if rssi < TARGET_RSSI - THRESHOLD
+            gain = min(gain+1, GAIN_MAX);
+        elseif rssi > TARGET_RSSI + THRESHOLD
+            gain = max(gain-1, GAIN_MIN);
+        end
+
+        rt_gain_history(end+1) = gain;
+        rt_rssi_history(end+1) = rssi;
+        rt_lo_history(end+1)   = lo;
+
+    end
+
+end
+
+%% ==========================================================
+%% ===================== VISUALIZATION =======================
+%% ==========================================================
+
+% --- LUT Plot ---
+figure;
+plot(lo_range, calibration_lut, '-o','LineWidth',2);
+xlabel('LO Frequency (MHz)');
+ylabel('Calibrated Gain Index');
+title('Calibration LUT vs LO Frequency');
+grid on;
+
+% --- Real-Time Gain Tracking ---
+figure;
+plot(rt_gain_history,'LineWidth',1.5);
+xlabel('Time Steps');
+ylabel('Gain Index');
+title('Real-Time Gain Correction Tracking');
+grid on;
+
+% --- Real-Time RSSI Tracking ---
+figure;
+plot(rt_rssi_history,'LineWidth',1.2);
+hold on;
+yline(TARGET_RSSI,'r--','Target');
+xlabel('Time Steps');
+ylabel('RSSI');
+title('Real-Time RSSI with Drift and Correction');
+grid on;
+
+
+Zynq PS (ARM)
+     |
+     | AXI
+     v
+AXI SPI  ----> AD9361 (Gain index control)
+AXI ADC  <---- AD9361 (RSSI readback)
+     |
+AXI GPIO (Mode control)
+
