@@ -1,0 +1,905 @@
+`timescale 1ns/1ps
+
+// ============================================================
+// RSSI GAIN STEP CALIBRATION TOP
+// ============================================================
+
+module rssi_gain_calibration_top;
+
+    reg clk = 0;
+    reg rst = 1;
+    reg start = 0;
+    reg [15:0] lo_freq = 16'd4500;
+
+    wire cal_done;
+
+    // SPI wires
+    wire spi_start;
+    wire spi_rw;
+    wire [15:0] spi_addr;
+    wire [7:0] spi_wdata;
+    wire [7:0] spi_rdata;
+    wire spi_done;
+
+    always #5 clk = ~clk;   // 100MHz clock
+
+    // DUT
+    rssi_gain_calibration DUT (
+        .clk(clk),
+        .rst(rst),
+        .start_cal(start),
+        .lo_freq_mhz(lo_freq),
+        .spi_start(spi_start),
+        .spi_rw(spi_rw),
+        .spi_addr(spi_addr),
+        .spi_wdata(spi_wdata),
+        .spi_rdata(spi_rdata),
+        .spi_done(spi_done),
+        .cal_done(cal_done)
+    );
+
+    // SPI + AD9361 Model
+    ad9361_model MODEL (
+        .clk(clk),
+        .spi_start(spi_start),
+        .spi_rw(spi_rw),
+        .spi_addr(spi_addr),
+        .spi_wdata(spi_wdata),
+        .spi_rdata(spi_rdata),
+        .spi_done(spi_done)
+    );
+
+    initial begin
+        #20 rst = 0;
+        #20 start = 1;
+        #10 start = 0;
+
+        wait(cal_done);
+        #100;
+
+        $display("Calibration Completed Successfully");
+        $finish;
+    end
+
+endmodule
+
+
+// ============================================================
+// CALIBRATION FSM
+// ============================================================
+
+module rssi_gain_calibration(
+    input clk,
+    input rst,
+    input start_cal,
+    input [15:0] lo_freq_mhz,
+
+    output spi_start,
+    output spi_rw,
+    output [15:0] spi_addr,
+    output [7:0] spi_wdata,
+    input [7:0] spi_rdata,
+    input spi_done,
+
+    output reg cal_done
+);
+
+parameter LO_MIN = 4000;
+parameter LO_MAX = 6000;
+parameter GAIN_MAX = 76;
+parameter RSSI_TARGET = 1200;
+
+reg [3:0] state;
+reg [7:0] gain_index;
+reg [15:0] rssi_value;
+reg [15:0] error_val;
+
+localparam IDLE=0, SET_GAIN=1, SET_LNA=2,
+           READ_MSB=3, READ_LSB=4,
+           COMPUTE=5, NEXT_GAIN=6, DONE=7;
+
+assign spi_start = (state==SET_GAIN) ||
+                   (state==SET_LNA) ||
+                   (state==READ_MSB) ||
+                   (state==READ_LSB);
+
+assign spi_rw = (state==READ_MSB || state==READ_LSB);
+
+assign spi_addr =
+    (state==SET_GAIN) ? 16'h0109 :
+    (state==SET_LNA)  ? 16'h0113 :
+    (state==READ_MSB) ? 16'h01A7 :
+    (state==READ_LSB) ? 16'h01A8 :
+                        16'h0000;
+
+assign spi_wdata =
+    (state==SET_GAIN) ? gain_index :
+    (state==SET_LNA)  ? 8'h01 : 8'h00;
+
+reg [15:0] cal_lut [0:GAIN_MAX];
+
+always @(posedge clk or posedge rst)
+begin
+    if (rst)
+    begin
+        state <= IDLE;
+        gain_index <= 0;
+        cal_done <= 0;
+    end
+    else
+    begin
+        case(state)
+
+        IDLE:
+        begin
+            cal_done <= 0;
+            if (start_cal &&
+                lo_freq_mhz >= LO_MIN &&
+                lo_freq_mhz <= LO_MAX)
+            begin
+                gain_index <= 0;
+                state <= SET_GAIN;
+            end
+        end
+
+        SET_GAIN:
+            if (spi_done) state <= SET_LNA;
+
+        SET_LNA:
+            if (spi_done) state <= READ_MSB;
+
+        READ_MSB:
+            if (spi_done)
+            begin
+                rssi_value[15:8] <= spi_rdata;
+                state <= READ_LSB;
+            end
+
+        READ_LSB:
+            if (spi_done)
+            begin
+                rssi_value[7:0] <= spi_rdata;
+                state <= COMPUTE;
+            end
+
+        COMPUTE:
+        begin
+            if (rssi_value > RSSI_TARGET)
+                error_val <= rssi_value - RSSI_TARGET;
+            else
+                error_val <= RSSI_TARGET - rssi_value;
+
+            cal_lut[gain_index] <= error_val;
+            state <= NEXT_GAIN;
+        end
+
+        NEXT_GAIN:
+        begin
+            if (gain_index < GAIN_MAX)
+            begin
+                gain_index <= gain_index + 1;
+                state <= SET_GAIN;
+            end
+            else
+                state <= DONE;
+        end
+
+        DONE:
+        begin
+            cal_done <= 1;
+            state <= IDLE;
+        end
+
+        endcase
+    end
+end
+
+endmodule
+
+
+// ============================================================
+// SIMPLE AD9361 BEHAVIORAL MODEL
+// ============================================================
+
+module ad9361_model(
+    input clk,
+    input spi_start,
+    input spi_rw,
+    input [15:0] spi_addr,
+    input [7:0] spi_wdata,
+    output reg [7:0] spi_rdata,
+    output reg spi_done
+);
+
+reg [7:0] gain_index = 0;
+reg [15:0] fake_rssi;
+
+always @(posedge clk)
+begin
+    spi_done <= 0;
+
+    if (spi_start)
+    begin
+        spi_done <= 1;
+
+        if (!spi_rw)
+        begin
+            if (spi_addr == 16'h0109)
+                gain_index <= spi_wdata;
+        end
+        else
+        begin
+            // RSSI model:
+            // RSSI = 800 + gain_index * 10
+            fake_rssi = 800 + gain_index * 10;
+
+            if (spi_addr == 16'h01A7)
+                spi_rdata <= fake_rssi[15:8];
+            else if (spi_addr == 16'h01A8)
+                spi_rdata <= fake_rssi[7:0];
+        end
+    end
+end
+
+endmodule
+
+gain_index → 0.5 dB step
+LNA ON → +15 dB
+LO variation → ±2 dB across 4–6 GHz
+Noise → ±1 dB random
+
+
+RSSI_code = (InputPower + TotalGain + 100) × 10
+
+
+RSSI_code = (InputPower + TotalGain + 100) × 10
+
+
+`timescale 1ns/1ps
+
+module rssi_gain_calibration(
+    input              clk,
+    input              rst,
+    input              start_cal,
+    input      [15:0]  lo_freq_mhz,
+
+    // SPI interface
+    output reg         spi_start,
+    output reg         spi_rw,
+    output reg [15:0]  spi_addr,
+    output reg [7:0]   spi_wdata,
+    input      [7:0]   spi_rdata,
+    input              spi_done,
+
+    output reg         cal_done
+);
+
+parameter LO_MIN       = 4000;
+parameter LO_MAX       = 6000;
+parameter GAIN_MAX     = 76;
+parameter TARGET_DBM   = -20;
+
+localparam IDLE      = 3'd0,
+           SET_GAIN  = 3'd1,
+           SET_LNA   = 3'd2,
+           READ_MSB  = 3'd3,
+           READ_LSB  = 3'd4,
+           COMPUTE   = 3'd5,
+           NEXT_GAIN = 3'd6,
+           DONE      = 3'd7;
+
+reg [2:0] state;
+reg [7:0] gain_index;
+reg [15:0] rssi_value;
+reg signed [15:0] measured_dbm;
+reg signed [15:0] error_val;
+
+// Calibration LUT
+reg signed [15:0] cal_lut [0:GAIN_MAX];
+
+always @(posedge clk or posedge rst)
+begin
+    if (rst)
+    begin
+        state       <= IDLE;
+        gain_index  <= 0;
+        cal_done    <= 0;
+        spi_start   <= 0;
+    end
+    else
+    begin
+        spi_start <= 0;
+
+        case(state)
+
+        IDLE:
+        begin
+            cal_done <= 0;
+            if (start_cal &&
+                lo_freq_mhz >= LO_MIN &&
+                lo_freq_mhz <= LO_MAX)
+            begin
+                gain_index <= 0;
+                state <= SET_GAIN;
+            end
+        end
+
+        SET_GAIN:
+        begin
+            spi_start <= 1;
+            spi_rw    <= 0;
+            spi_addr  <= 16'h0109;
+            spi_wdata <= gain_index;
+            if (spi_done)
+                state <= SET_LNA;
+        end
+
+        SET_LNA:
+        begin
+            spi_start <= 1;
+            spi_rw    <= 0;
+            spi_addr  <= 16'h0113;
+            spi_wdata <= 8'h01;  // LNA ON
+            if (spi_done)
+                state <= READ_MSB;
+        end
+
+        READ_MSB:
+        begin
+            spi_start <= 1;
+            spi_rw    <= 1;
+            spi_addr  <= 16'h01A7;
+            if (spi_done)
+            begin
+                rssi_value[15:8] <= spi_rdata;
+                state <= READ_LSB;
+            end
+        end
+
+        READ_LSB:
+        begin
+            spi_start <= 1;
+            spi_rw    <= 1;
+            spi_addr  <= 16'h01A8;
+            if (spi_done)
+            begin
+                rssi_value[7:0] <= spi_rdata;
+                state <= COMPUTE;
+            end
+        end
+
+        COMPUTE:
+        begin
+            // Reverse RSSI mapping
+            measured_dbm <= (rssi_value / 10) - 100;
+            error_val    <= measured_dbm - TARGET_DBM;
+
+            cal_lut[gain_index] <= error_val;
+            state <= NEXT_GAIN;
+        end
+
+        NEXT_GAIN:
+        begin
+            if (gain_index < GAIN_MAX)
+            begin
+                gain_index <= gain_index + 1;
+                state <= SET_GAIN;
+            end
+            else
+                state <= DONE;
+        end
+
+        DONE:
+        begin
+            cal_done <= 1;
+            state <= IDLE;
+        end
+
+        endcase
+    end
+end
+
+endmodule
+
+
+
+`timescale 1ns/1ps
+
+module rssi_gain_calibration_tb;
+
+reg clk = 0;
+reg rst = 1;
+reg start = 0;
+reg [15:0] lo_freq = 16'd5200;
+
+wire spi_start;
+wire spi_rw;
+wire [15:0] spi_addr;
+wire [7:0] spi_wdata;
+wire [7:0] spi_rdata;
+wire spi_done;
+wire cal_done;
+
+always #5 clk = ~clk;
+
+// DUT
+rssi_gain_calibration DUT (
+    .clk(clk),
+    .rst(rst),
+    .start_cal(start),
+    .lo_freq_mhz(lo_freq),
+    .spi_start(spi_start),
+    .spi_rw(spi_rw),
+    .spi_addr(spi_addr),
+    .spi_wdata(spi_wdata),
+    .spi_rdata(spi_rdata),
+    .spi_done(spi_done),
+    .cal_done(cal_done)
+);
+
+// -------------------------------------------------
+// AD9361 REALISTIC MODEL
+// -------------------------------------------------
+
+reg [7:0] gain_index = 0;
+reg lna_on = 0;
+reg [7:0] spi_rdata_reg;
+reg spi_done_reg;
+
+assign spi_rdata = spi_rdata_reg;
+assign spi_done  = spi_done_reg;
+
+integer input_power;
+integer total_gain_db;
+integer lo_variation;
+integer noise;
+integer output_dbm;
+integer fake_rssi;
+
+always @(posedge clk)
+begin
+    spi_done_reg <= 0;
+
+    if (spi_start)
+    begin
+        spi_done_reg <= 1;
+
+        if (!spi_rw)
+        begin
+            if (spi_addr == 16'h0109)
+                gain_index <= spi_wdata;
+
+            if (spi_addr == 16'h0113)
+                lna_on <= spi_wdata[0];
+        end
+        else
+        begin
+            input_power = -60;
+            total_gain_db = gain_index / 2;
+
+            if (lna_on)
+                total_gain_db = total_gain_db + 15;
+
+            lo_variation = (lo_freq - 5000) / 500;
+            noise = $random % 2;
+
+            output_dbm = input_power
+                       + total_gain_db
+                       + lo_variation
+                       + noise;
+
+            fake_rssi = (output_dbm + 100) * 10;
+
+            if (spi_addr == 16'h01A7)
+                spi_rdata_reg <= fake_rssi[15:8];
+            else if (spi_addr == 16'h01A8)
+                spi_rdata_reg <= fake_rssi[7:0];
+        end
+    end
+end
+
+// -------------------------------------------------
+// TEST SEQUENCE
+// -------------------------------------------------
+
+initial begin
+    #20 rst = 0;
+    #20 start = 1;
+    #10 start = 0;
+
+    wait(cal_done);
+
+    $display("Calibration completed for LO = %d MHz", lo_freq);
+
+    #100 $finish;
+end
+
+endmodule
+
+
+clc;
+clear;
+close all;
+
+%% ================================
+%  PARAMETERS (Realistic Model)
+% ================================
+
+LO_freq = 5200;              % MHz (try 4000–6000)
+LO_min  = 4000;
+LO_max  = 6000;
+
+if LO_freq < LO_min || LO_freq > LO_max
+    error('LO frequency out of supported range (4000–6000 MHz)');
+end
+
+GAIN_MAX = 76;               % AD9361 gain index max
+TARGET_DBM = -20;            % Calibration target power
+INPUT_POWER_DBM = -60;       % Injected RF tone
+LNA_GAIN_DB = 15;            % LNA contribution
+
+%% ================================
+%  PRE-ALLOCATE ARRAYS
+% ================================
+
+gain_index = 0:GAIN_MAX;
+measured_dbm = zeros(size(gain_index));
+rssi_digital = zeros(size(gain_index));
+error_lut = zeros(size(gain_index));
+
+%% ================================
+%  LO Frequency Gain Variation
+% ================================
+% ±2 dB variation across 4–6 GHz
+
+lo_variation = (LO_freq - 5000) / 500;   % ~ ±2 dB
+
+%% ================================
+%  CALIBRATION LOOP
+% ================================
+
+for k = 1:length(gain_index)
+
+    % Gain step = 0.5 dB per index
+    gain_db = gain_index(k) * 0.5;
+
+    % Add LNA gain
+    total_gain = gain_db + LNA_GAIN_DB;
+
+    % Add noise (±1 dB)
+    noise_db = randi([-1 1]);
+
+    % Output RF power
+    output_dbm = INPUT_POWER_DBM ...
+               + total_gain ...
+               + lo_variation ...
+               + noise_db;
+
+    % Convert to digital RSSI
+    % Mapping: RSSI = (dBm + 100) * 10
+    rssi_code = (output_dbm + 100) * 10;
+
+    % Reverse conversion (as FPGA would do)
+    measured_power = (rssi_code / 10) - 100;
+
+    % Error calculation
+    error = measured_power - TARGET_DBM;
+
+    % Store results
+    measured_dbm(k) = measured_power;
+    rssi_digital(k) = rssi_code;
+    error_lut(k) = error;
+end
+
+%% ================================
+%  FIND OPTIMAL GAIN INDEX
+% ================================
+
+[~, optimal_idx] = min(abs(error_lut));
+optimal_gain_index = gain_index(optimal_idx);
+
+fprintf('-----------------------------------------\n');
+fprintf('LO Frequency        : %d MHz\n', LO_freq);
+fprintf('Target Power        : %d dBm\n', TARGET_DBM);
+fprintf('Optimal Gain Index  : %d\n', optimal_gain_index);
+fprintf('Measured Power      : %.2f dBm\n', measured_dbm(optimal_idx));
+fprintf('-----------------------------------------\n');
+
+%% ================================
+%  VISUALIZATION
+% ================================
+
+figure;
+plot(gain_index, measured_dbm, 'LineWidth', 2);
+hold on;
+yline(TARGET_DBM, '--r', 'Target');
+xlabel('Gain Index');
+ylabel('Measured Power (dBm)');
+title('Measured Power vs Gain Index');
+grid on;
+
+figure;
+plot(gain_index, error_lut, 'LineWidth', 2);
+xlabel('Gain Index');
+ylabel('Calibration Error (dB)');
+title('Calibration Error vs Gain Index');
+grid on;
+
+figure;
+plot(gain_index, rssi_digital, 'LineWidth', 2);
+xlabel('Gain Index');
+ylabel('Digital RSSI Code');
+title('Digital RSSI vs Gain Index');
+grid on;
+
+
+%% ================================
+%  VISUALIZATION
+% ================================
+
+figure;
+plot(gain_index, measured_dbm, 'LineWidth', 2);
+hold on;
+
+% Draw target line (MATLAB compatible)
+plot([min(gain_index) max(gain_index)], ...
+     [TARGET_DBM TARGET_DBM], '--r', 'LineWidth', 2);
+
+xlabel('Gain Index');
+ylabel('Measured Power (dBm)');
+title('Measured Power vs Gain Index');
+legend('Measured Power', 'Target Power');
+grid on;
+
+
+figure;
+plot(gain_index, error_lut, 'LineWidth', 2);
+xlabel('Gain Index');
+ylabel('Calibration Error (dB)');
+title('Calibration Error vs Gain Index');
+grid on;
+
+
+figure;
+plot(gain_index, rssi_digital, 'LineWidth', 2);
+xlabel('Gain Index');
+ylabel('Digital RSSI Code');
+title('Digital RSSI vs Gain Index');
+grid on;
+
+
+clc;
+clear;
+close all;
+
+%% ================================
+% SYSTEM PARAMETERS
+% ================================
+
+LO_min = 4000;
+LO_max = 6000;
+LO_step = 100;                     % 100 MHz step
+
+LO_vector = LO_min:LO_step:LO_max;
+
+GAIN_MAX = 76;
+gain_index = 0:GAIN_MAX;
+
+TARGET_DBM = -20;
+INPUT_POWER_DBM = -60;
+LNA_GAIN_DB = 15;
+
+%% ================================
+% PRE-ALLOCATE RESULTS
+% ================================
+
+optimal_gain_vs_lo = zeros(size(LO_vector));
+measured_power_vs_lo = zeros(size(LO_vector));
+
+%% ================================
+% LO SWEEP LOOP
+% ================================
+
+for f = 1:length(LO_vector)
+
+    LO_freq = LO_vector(f);
+
+    error_lut = zeros(size(gain_index));
+    measured_dbm = zeros(size(gain_index));
+
+    % LO variation model (±2 dB across band)
+    lo_variation = (LO_freq - 5000) / 500;
+
+    for k = 1:length(gain_index)
+
+        gain_db = gain_index(k) * 0.5;
+
+        total_gain = gain_db + LNA_GAIN_DB;
+
+        noise_db = randi([-1 1],1,1);
+
+        output_dbm = INPUT_POWER_DBM + ...
+                     total_gain + ...
+                     lo_variation + ...
+                     noise_db;
+
+        % Digital RSSI model
+        rssi_code = (output_dbm + 100) * 10;
+
+        measured_power = (rssi_code / 10) - 100;
+
+        error_lut(k) = measured_power - TARGET_DBM;
+        measured_dbm(k) = measured_power;
+
+    end
+
+    % Find optimal gain index for this LO
+    [~, idx] = min(abs(error_lut));
+
+    optimal_gain_vs_lo(f) = gain_index(idx);
+    measured_power_vs_lo(f) = measured_dbm(idx);
+
+end
+
+%% ================================
+% DISPLAY RESULTS
+% ================================
+
+fprintf('\nLO Frequency Sweep (100 MHz Step)\n');
+fprintf('----------------------------------------\n');
+
+for i = 1:length(LO_vector)
+    fprintf('LO = %4d MHz  |  Optimal Gain Index = %2d  |  Power = %.2f dBm\n', ...
+        LO_vector(i), optimal_gain_vs_lo(i), measured_power_vs_lo(i));
+end
+
+%% ================================
+% PLOTS
+% ================================
+
+% Plot 1: Gain Index vs LO
+figure;
+plot(LO_vector, optimal_gain_vs_lo, 'b-o', 'LineWidth', 2);
+xlabel('LO Frequency (MHz)');
+ylabel('Optimal Gain Index');
+title('Optimal Gain Index vs LO Frequency');
+grid on;
+
+% Plot 2: Measured Power vs LO
+figure;
+plot(LO_vector, measured_power_vs_lo, 'r-s', 'LineWidth', 2);
+hold on;
+
+% Manual target line (R2014 safe)
+plot([min(LO_vector) max(LO_vector)], ...
+     [TARGET_DBM TARGET_DBM], 'k--', 'LineWidth', 2);
+
+xlabel('LO Frequency (MHz)');
+ylabel('Measured Power (dBm)');
+title('Measured Power vs LO Frequency');
+legend('Measured Power','Target Power');
+grid on;
+
+
+clc;
+clear;
+close all;
+
+%% ==========================================
+% SYSTEM PARAMETERS
+%% ==========================================
+
+LO_min  = 4000;
+LO_max  = 6000;
+LO_step = 100;
+LO_vector = LO_min:LO_step:LO_max;
+
+TEMP_vector = -20:10:70;   % Temperature sweep
+
+GAIN_MAX = 76;
+gain_index = 0:GAIN_MAX;
+
+TARGET_DBM = -20;
+INPUT_POWER_DBM = -60;
+LNA_GAIN_DB = 15;
+
+RSSI_AVG_COUNT = 16;   % RSSI averaging
+
+%% ==========================================
+% PRE-ALLOCATE LUT
+%% ==========================================
+
+LUT_gain = zeros(length(LO_vector), length(TEMP_vector));
+
+%% ==========================================
+% CALIBRATION LO + TEMP SWEEP
+%% ==========================================
+
+for f = 1:length(LO_vector)
+
+    LO_freq = LO_vector(f);
+    lo_variation = (LO_freq - 5000) / 500;  % ±2 dB
+
+    for t = 1:length(TEMP_vector)
+
+        temp = TEMP_vector(t);
+
+        % Temperature drift model (0.02 dB/°C)
+        temp_drift = 0.02 * (temp - 25);
+
+        error_lut = zeros(size(gain_index));
+
+        for k = 1:length(gain_index)
+
+            gain_db = gain_index(k) * 0.5;
+            total_gain = gain_db + LNA_GAIN_DB;
+
+            avg_power = 0;
+
+            % RSSI averaging loop
+            for n = 1:RSSI_AVG_COUNT
+
+                noise_db = randi([-1 1],1,1);
+
+                output_dbm = INPUT_POWER_DBM ...
+                           + total_gain ...
+                           + lo_variation ...
+                           + temp_drift ...
+                           + noise_db;
+
+                avg_power = avg_power + output_dbm;
+
+            end
+
+            avg_power = avg_power / RSSI_AVG_COUNT;
+
+            error_lut(k) = avg_power - TARGET_DBM;
+
+        end
+
+        [~, idx] = min(abs(error_lut));
+        LUT_gain(f,t) = gain_index(idx);
+
+    end
+end
+
+%% ==========================================
+% DISPLAY SAMPLE OUTPUT
+%% ==========================================
+
+fprintf('\nCalibration LUT (Gain Index)\n');
+fprintf('Rows = LO (4000–6000 MHz)\n');
+fprintf('Cols = Temperature (-20 to 70 C)\n\n');
+disp(LUT_gain);
+
+%% ==========================================
+% 3D SURFACE PLOT
+%% ==========================================
+
+[LO_grid, TEMP_grid] = meshgrid(LO_vector, TEMP_vector);
+
+figure;
+surf(LO_grid, TEMP_grid, LUT_gain');
+xlabel('LO Frequency (MHz)');
+ylabel('Temperature (°C)');
+zlabel('Optimal Gain Index');
+title('3D Gain Calibration Surface');
+shading interp;
+colorbar;
+grid on;
+
+%% ==========================================
+% EXPORT LUT FOR FPGA (.mem file)
+%% ==========================================
+
+fileID = fopen('gain_calibration_LUT.mem','w');
+
+for f = 1:length(LO_vector)
+    for t = 1:length(TEMP_vector)
+        fprintf(fileID,'%d\n', LUT_gain(f,t));
+    end
+end
+
+fclose(fileID);
+
+fprintf('\nLUT exported to gain_calibration_LUT.mem\n');
