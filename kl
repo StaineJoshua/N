@@ -1,0 +1,718 @@
+`timescale 1ns/1ps
+
+module ad9361_rssi_calibration(
+
+input clk,
+input reset,
+
+// RSSI interface
+input [15:0] rssi_value,
+input rssi_valid,
+
+// SPI interface
+output reg spi_cs,
+output reg spi_clk,
+output reg spi_mosi,
+
+// Debug outputs
+output reg [31:0] lo_freq,
+output reg [6:0] gain_index,
+output reg calibration_done
+
+);
+
+// PARAMETERS
+
+parameter LO_START = 32'd4000;
+parameter LO_END   = 32'd6000;
+parameter LO_STEP  = 32'd100;
+
+parameter TARGET_RSSI = 16'd500;
+parameter MAX_GAIN = 7'd76;
+
+
+// STATE MACHINE
+
+reg [3:0] state;
+
+localparam IDLE        = 0;
+localparam SET_LO      = 1;
+localparam SET_GAIN    = 2;
+localparam WAIT_RSSI   = 3;
+localparam ADJUST_GAIN = 4;
+localparam STORE       = 5;
+localparam NEXT_GAIN   = 6;
+localparam NEXT_LO     = 7;
+localparam DONE        = 8;
+
+
+// SPI
+
+reg [15:0] spi_shift;
+reg [4:0] spi_count;
+reg spi_start;
+
+
+// INITIAL
+
+always @(posedge clk or posedge reset)
+begin
+if(reset)
+begin
+    lo_freq <= LO_START;
+    gain_index <= 0;
+    calibration_done <= 0;
+    state <= IDLE;
+end
+
+else
+begin
+
+case(state)
+
+IDLE:
+state <= SET_LO;
+
+
+// PROGRAM LO FREQUENCY
+
+SET_LO:
+begin
+    spi_shift <= {6'h00,10'h231}; // LO register
+    spi_start <= 1;
+    state <= SET_GAIN;
+end
+
+
+// PROGRAM GAIN INDEX
+
+SET_GAIN:
+begin
+    spi_shift <= {6'h00,10'h109}; // gain register
+    spi_start <= 1;
+    state <= WAIT_RSSI;
+end
+
+
+// WAIT FOR RSSI
+
+WAIT_RSSI:
+begin
+    if(rssi_valid)
+    state <= ADJUST_GAIN;
+end
+
+
+// ADJUST GAIN
+
+ADJUST_GAIN:
+begin
+    if(rssi_value < TARGET_RSSI)
+    gain_index <= gain_index + 1;
+    else
+    state <= STORE;
+end
+
+
+// STORE CALIBRATION
+
+STORE:
+begin
+    state <= NEXT_GAIN;
+end
+
+
+// NEXT GAIN
+
+NEXT_GAIN:
+begin
+    if(gain_index < MAX_GAIN)
+    state <= SET_GAIN;
+    else
+    state <= NEXT_LO;
+end
+
+
+// NEXT LO
+
+NEXT_LO:
+begin
+    gain_index <= 0;
+    lo_freq <= lo_freq + LO_STEP;
+
+    if(lo_freq >= LO_END)
+    state <= DONE;
+    else
+    state <= SET_LO;
+end
+
+
+DONE:
+begin
+    calibration_done <= 1;
+end
+
+
+endcase
+end
+end
+
+
+
+// SPI MASTER (simplified)
+
+always @(posedge clk)
+begin
+
+if(spi_start)
+begin
+    spi_cs <= 0;
+    spi_count <= 16;
+end
+
+else if(spi_count > 0)
+begin
+    spi_mosi <= spi_shift[15];
+    spi_shift <= spi_shift << 1;
+    spi_clk <= ~spi_clk;
+    spi_count <= spi_count - 1;
+end
+
+else
+spi_cs <= 1;
+
+end
+
+endmodule
+
+
+
+`timescale 1ns/1ps
+
+module tb_ad9361_rssi_calibration;
+
+reg clk;
+reg reset;
+
+reg [15:0] rssi_value;
+reg rssi_valid;
+
+wire spi_cs;
+wire spi_clk;
+wire spi_mosi;
+
+wire [31:0] lo_freq;
+wire [6:0] gain_index;
+wire calibration_done;
+
+
+// DUT
+
+ad9361_rssi_calibration DUT(
+
+.clk(clk),
+.reset(reset),
+
+.rssi_value(rssi_value),
+.rssi_valid(rssi_valid),
+
+.spi_cs(spi_cs),
+.spi_clk(spi_clk),
+.spi_mosi(spi_mosi),
+
+.lo_freq(lo_freq),
+.gain_index(gain_index),
+.calibration_done(calibration_done)
+
+);
+
+
+// CLOCK
+
+always #5 clk = ~clk;
+
+
+// INITIAL
+
+initial
+begin
+
+clk = 0;
+reset = 1;
+rssi_valid = 0;
+
+#20
+reset = 0;
+
+end
+
+
+
+// RSSI MODEL
+
+always @(posedge clk)
+begin
+
+rssi_valid <= 1;
+
+// realistic RSSI response
+
+rssi_value <= (gain_index * 15) + (lo_freq/200);
+
+end
+
+
+
+// SIMULATION CONTROL
+
+initial
+begin
+
+#500000
+
+$display("Calibration Complete");
+$finish;
+
+end
+
+endmodule
+
+clc;
+clear;
+close all;
+
+%% AD9361 PARAMETERS
+
+LO_start = 4000;   % MHz
+LO_end   = 6000;   % MHz
+LO_step  = 100;    % MHz
+
+gain_min = 0;
+gain_max = 76;
+
+target_rssi = -50; % dBm target
+
+LO_vector = LO_start:LO_step:LO_end;
+
+num_lo = length(LO_vector);
+
+cal_gain = zeros(1,num_lo);
+cal_rssi = zeros(1,num_lo);
+
+%% RSSI MODEL FUNCTION
+% Simulated RF behavior
+
+rssi_model = @(gain,lo) (-90 + gain*0.6 + (lo-4000)/200);
+
+%% CALIBRATION LOOP
+
+for i = 1:num_lo
+
+    lo = LO_vector(i);
+    
+    best_gain = 0;
+    best_rssi = -100;
+    
+    for gain = gain_min:gain_max
+        
+        rssi = rssi_model(gain,lo);
+        
+        if rssi >= target_rssi
+            best_gain = gain;
+            best_rssi = rssi;
+            break
+        end
+        
+    end
+    
+    cal_gain(i) = best_gain;
+    cal_rssi(i) = best_rssi;
+
+end
+
+%% CALIBRATION TABLE
+
+Calibration_Table = table(LO_vector',cal_gain',cal_rssi',...
+    'VariableNames',{'LO_MHz','Gain_Index','RSSI_dBm'});
+
+disp(Calibration_Table)
+
+%% VISUALIZATION
+
+figure
+plot(LO_vector,cal_gain,'-o','LineWidth',2)
+grid on
+xlabel('LO Frequency (MHz)')
+ylabel('Gain Index')
+title('AD9361 RSSI Gain Step Calibration')
+
+
+figure
+plot(LO_vector,cal_rssi,'-s','LineWidth',2)
+grid on
+xlabel('LO Frequency (MHz)')
+ylabel('RSSI (dBm)')
+title('RSSI vs LO Frequency After Calibration')
+
+
+figure
+surf(LO_vector,gain_min:gain_max,...
+    arrayfun(@(g,l) rssi_model(g,l), ...
+    (gain_min:gain_max)', LO_vector))
+shading interp
+xlabel('LO Frequency (MHz)')
+ylabel('Gain Index')
+zlabel('RSSI (dBm)')
+title('RSSI Response Surface')
+
+
+`timescale 1ns/1ps
+
+module ad9361_rssi_calibration_system(
+
+input clk,
+input reset,
+
+// RSSI feedback
+input [15:0] rssi_value,
+input rssi_valid,
+
+// SPI interface
+output reg spi_cs,
+output reg spi_clk,
+output reg spi_mosi,
+
+// debug
+output reg [31:0] lo_freq,
+output reg [6:0] gain_index
+
+);
+
+parameter TARGET_RSSI = 16'd500;
+
+parameter LO_START = 4000;
+parameter LO_STEP  = 100;
+parameter LO_POINTS = 21;
+
+parameter MAX_GAIN = 76;
+
+// FSM
+
+reg [3:0] state;
+
+localparam SET_LO      = 0;
+localparam SET_GAIN    = 1;
+localparam WAIT_RSSI   = 2;
+localparam STORE       = 3;
+localparam NEXT_GAIN   = 4;
+localparam NEXT_LO     = 5;
+
+
+// LUT
+
+reg [6:0] calibration_lut [0:20];
+
+reg [4:0] lo_index;
+
+
+// SPI
+
+reg [15:0] spi_shift;
+reg [4:0] spi_count;
+reg spi_start;
+
+
+// FSM Logic
+
+always @(posedge clk or posedge reset)
+begin
+
+if(reset)
+begin
+
+state <= SET_LO;
+lo_index <= 0;
+gain_index <= 0;
+
+end
+
+else
+begin
+
+case(state)
+
+SET_LO:
+begin
+
+lo_freq <= LO_START + lo_index*LO_STEP;
+
+spi_shift <= {6'h00,10'h231};
+spi_start <= 1;
+
+state <= SET_GAIN;
+
+end
+
+
+SET_GAIN:
+begin
+
+spi_shift <= {6'h00,10'h109};
+spi_start <= 1;
+
+state <= WAIT_RSSI;
+
+end
+
+
+WAIT_RSSI:
+begin
+
+if(rssi_valid)
+begin
+
+if(rssi_value < TARGET_RSSI && gain_index < MAX_GAIN)
+
+gain_index <= gain_index + 1;
+
+else
+
+state <= STORE;
+
+end
+
+end
+
+
+STORE:
+begin
+
+calibration_lut[lo_index] <= gain_index;
+
+state <= NEXT_GAIN;
+
+end
+
+
+NEXT_GAIN:
+begin
+
+gain_index <= 0;
+state <= NEXT_LO;
+
+end
+
+
+NEXT_LO:
+begin
+
+lo_index <= lo_index + 1;
+
+if(lo_index < LO_POINTS)
+
+state <= SET_LO;
+
+end
+
+endcase
+
+end
+
+end
+
+
+
+// SPI MASTER
+
+always @(posedge clk)
+begin
+
+if(spi_start)
+begin
+
+spi_cs <= 0;
+spi_count <= 16;
+
+end
+
+else if(spi_count > 0)
+begin
+
+spi_mosi <= spi_shift[15];
+spi_shift <= spi_shift << 1;
+spi_clk <= ~spi_clk;
+spi_count <= spi_count - 1;
+
+end
+
+else
+
+spi_cs <= 1;
+
+end
+
+endmodule
+
+`timescale 1ns/1ps
+
+module tb_ad9361_calibration;
+
+reg clk;
+reg reset;
+
+reg [15:0] rssi_value;
+reg rssi_valid;
+
+wire spi_cs;
+wire spi_clk;
+wire spi_mosi;
+
+wire [31:0] lo_freq;
+wire [6:0] gain_index;
+
+
+// DUT
+
+ad9361_rssi_calibration_system DUT(
+
+.clk(clk),
+.reset(reset),
+
+.rssi_value(rssi_value),
+.rssi_valid(rssi_valid),
+
+.spi_cs(spi_cs),
+.spi_clk(spi_clk),
+.spi_mosi(spi_mosi),
+
+.lo_freq(lo_freq),
+.gain_index(gain_index)
+
+);
+
+
+// Clock
+
+always #5 clk = ~clk;
+
+
+// Initialization
+
+initial
+begin
+
+clk = 0;
+reset = 1;
+
+#20
+reset = 0;
+
+end
+
+
+// RSSI Model
+
+always @(posedge clk)
+begin
+
+rssi_valid <= 1;
+
+// realistic RF model
+
+rssi_value <= (gain_index * 14) + (lo_freq/250);
+
+end
+
+
+initial
+begin
+
+#1000000
+
+$display("Calibration simulation finished");
+
+$finish;
+
+end
+
+endmodule
+
+
+clc
+clear
+close all
+
+%% AD9361 PARAMETERS
+
+LO = 4000:100:6000;
+gain = 0:76;
+
+target_rssi = -50;
+
+num_lo = length(LO);
+
+best_gain = zeros(1,num_lo);
+best_rssi = zeros(1,num_lo);
+
+%% RSSI MODEL
+
+for i = 1:num_lo
+    
+    lo = LO(i);
+    
+    for g = gain
+        
+        % RF response model
+        rssi = -90 + g*0.65 + (lo-4000)/180 + randn*0.2;
+        
+        if rssi >= target_rssi
+            
+            best_gain(i) = g;
+            best_rssi(i) = rssi;
+            break
+            
+        end
+        
+    end
+    
+end
+
+%% Calibration LUT
+
+Calibration_LUT = table(LO',best_gain',best_rssi',...
+    'VariableNames',{'LO_MHz','Gain_Index','RSSI_dBm'});
+
+disp(Calibration_LUT)
+
+%% Plot 1 Gain vs Frequency
+
+figure
+plot(LO,best_gain,'-o','LineWidth',2)
+grid on
+xlabel('LO Frequency (MHz)')
+ylabel('Gain Index')
+title('AD9361 RSSI Gain Calibration')
+
+%% Plot 2 RSSI vs Frequency
+
+figure
+plot(LO,best_rssi,'-s','LineWidth',2)
+grid on
+xlabel('LO Frequency (MHz)')
+ylabel('RSSI (dBm)')
+title('RSSI Stability After Calibration')
+
+%% Plot 3 RSSI Surface
+
+[G,F] = meshgrid(gain,LO);
+
+RSSI = -90 + G*0.65 + (F-4000)/180;
+
+figure
+surf(F,G,RSSI)
+shading interp
+xlabel('LO Frequency (MHz)')
+ylabel('Gain Index')
+zlabel('RSSI (dBm)')
+title('RSSI Response Surface')
+
