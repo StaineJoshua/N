@@ -1,0 +1,561 @@
+module ad9361_rssi_calibration(
+
+input clk,
+input rst,
+
+/* RSSI input from AD9361 */
+input [11:0] rssi_in,
+
+/* SPI interface */
+output reg spi_start,
+output reg [15:0] spi_addr,
+output reg [7:0] spi_data,
+
+/* Calibration done */
+output reg calib_done
+);
+
+/* PARAMETERS */
+
+parameter LO_START = 4000;
+parameter LO_END   = 6000;
+parameter STEP     = 100;
+
+parameter GAIN_MAX = 76;
+
+parameter TARGET_RSSI = 12'd1200;
+
+
+/* INTERNAL REGISTERS */
+
+reg [15:0] lo_freq;
+reg [6:0] gain_index;
+
+reg [31:0] rssi_acc;
+reg [7:0] avg_count;
+
+reg [11:0] rssi_avg;
+reg signed [15:0] error;
+
+
+/* LUT MEMORY */
+
+reg signed [15:0] calibration_LUT [0:20][0:76];
+
+
+/* FSM STATES */
+
+reg [3:0] state;
+
+parameter IDLE      = 0;
+parameter SET_LO    = 1;
+parameter SET_GAIN  = 2;
+parameter WAIT_RSSI = 3;
+parameter AVERAGE   = 4;
+parameter COMPUTE   = 5;
+parameter STORE     = 6;
+parameter NEXT_GAIN = 7;
+parameter NEXT_LO   = 8;
+parameter DONE      = 9;
+
+
+/* FSM */
+
+always @(posedge clk)
+begin
+
+if(rst)
+begin
+state <= IDLE;
+lo_freq <= LO_START;
+gain_index <= 0;
+rssi_acc <= 0;
+avg_count <= 0;
+calib_done <= 0;
+end
+
+else
+begin
+
+case(state)
+
+/* START */
+
+IDLE:
+begin
+state <= SET_LO;
+end
+
+
+/* SET LO FREQUENCY */
+
+SET_LO:
+begin
+
+spi_addr <= 16'h0045;  // Example LO register
+spi_data <= lo_freq[7:0];
+spi_start <= 1;
+
+state <= SET_GAIN;
+
+end
+
+
+/* SET GAIN INDEX */
+
+SET_GAIN:
+begin
+
+spi_addr <= 16'h0109;  // Gain control register
+spi_data <= gain_index;
+
+spi_start <= 1;
+
+state <= WAIT_RSSI;
+
+end
+
+
+/* RSSI SAMPLE */
+
+WAIT_RSSI:
+begin
+
+rssi_acc <= rssi_acc + rssi_in;
+avg_count <= avg_count + 1;
+
+if(avg_count == 64)
+state <= AVERAGE;
+
+end
+
+
+/* AVERAGE */
+
+AVERAGE:
+begin
+
+rssi_avg <= rssi_acc >> 6;
+
+rssi_acc <= 0;
+avg_count <= 0;
+
+state <= COMPUTE;
+
+end
+
+
+/* ERROR CALCULATION */
+
+COMPUTE:
+begin
+
+error <= TARGET_RSSI - rssi_avg;
+
+state <= STORE;
+
+end
+
+
+/* STORE IN LUT */
+
+STORE:
+begin
+
+calibration_LUT[(lo_freq-LO_START)/STEP][gain_index] <= error;
+
+state <= NEXT_GAIN;
+
+end
+
+
+/* NEXT GAIN */
+
+NEXT_GAIN:
+begin
+
+if(gain_index < GAIN_MAX)
+begin
+gain_index <= gain_index + 1;
+state <= SET_GAIN;
+end
+
+else
+begin
+gain_index <= 0;
+state <= NEXT_LO;
+end
+
+end
+
+
+/* NEXT LO */
+
+NEXT_LO:
+begin
+
+if(lo_freq < LO_END)
+begin
+lo_freq <= lo_freq + STEP;
+state <= SET_LO;
+end
+
+else
+state <= DONE;
+
+end
+
+
+DONE:
+begin
+calib_done <= 1;
+end
+
+
+endcase
+
+end
+end
+
+endmodule
+
+
+`timescale 1ns/1ps
+
+module tb_ad9361_rssi_calibration;
+
+reg clk;
+reg rst;
+
+reg [11:0] rssi_in;
+
+wire spi_start;
+wire [15:0] spi_addr;
+wire [7:0] spi_data;
+
+wire calib_done;
+
+
+ad9361_rssi_calibration DUT(
+
+.clk(clk),
+.rst(rst),
+.rssi_in(rssi_in),
+
+.spi_start(spi_start),
+.spi_addr(spi_addr),
+.spi_data(spi_data),
+
+.calib_done(calib_done)
+
+);
+
+
+/* CLOCK */
+
+always #5 clk = ~clk;
+
+
+/* SIMULATION */
+
+initial
+begin
+
+clk = 0;
+rst = 1;
+
+#50
+rst = 0;
+
+end
+
+
+/* RSSI MODEL */
+
+always @(posedge clk)
+begin
+
+/* Simulated RF response */
+
+rssi_in <= 1000 + $random % 200;
+
+end
+
+
+initial
+begin
+
+#500000
+$finish;
+
+end
+
+
+endmodule
+
+
+
+clc;
+clear;
+close all;
+
+%% PARAMETERS
+
+LO_start = 4000;
+LO_end   = 6000;
+LO_step  = 100;
+
+LO_freq = LO_start:LO_step:LO_end;
+
+num_LO = length(LO_freq);
+
+gain_steps = 0:76;
+num_gain = length(gain_steps);
+
+target_rssi = -30;
+
+avg_samples = 64;
+
+%% MEMORY FOR LUT
+
+calibration_LUT = zeros(num_LO,num_gain);
+measured_RSSI = zeros(num_LO,num_gain);
+
+%% SIMULATED RF RESPONSE MODEL
+
+for lo = 1:num_LO
+    
+    freq = LO_freq(lo);
+    
+    % Frequency dependent gain error
+    freq_error = 2*sin(freq/800);
+    
+    for g = 1:num_gain
+        
+        gain = gain_steps(g);
+        
+        rssi_samples = zeros(avg_samples,1);
+        
+        for k = 1:avg_samples
+            
+            % Simulated RSSI model
+            
+            gain_response = -40 + gain*0.5;
+            
+            noise = randn()*0.5;
+            
+            rssi_samples(k) = gain_response + freq_error + noise;
+            
+        end
+        
+        %% DSP AVERAGING FILTER
+        
+        rssi_avg = mean(rssi_samples);
+        
+        measured_RSSI(lo,g) = rssi_avg;
+        
+        %% ERROR CALCULATION
+        
+        error = target_rssi - rssi_avg;
+        
+        %% STORE IN CALIBRATION LUT
+        
+        calibration_LUT(lo,g) = error;
+        
+    end
+    
+end
+
+disp("Calibration Completed")
+
+
+clc;
+clear;
+close all;
+
+%% -----------------------------
+%  RSSI GAIN STEP CALIBRATION
+%  AD9361
+%  LO Range : 4000–6000 MHz
+%  Step     : 100 MHz
+%% -----------------------------
+
+LO_start = 4000;
+LO_end   = 6000;
+LO_step  = 100;
+
+LO_freq = LO_start:LO_step:LO_end;
+num_LO = length(LO_freq);
+
+gain_steps = 0:76;
+num_gain = length(gain_steps);
+
+target_rssi = -30;
+avg_samples = 64;
+
+%% MEMORY ALLOCATION
+
+measured_RSSI = zeros(num_LO,num_gain);
+calibration_LUT = zeros(num_LO,num_gain);
+corrected_RSSI = zeros(num_LO,num_gain);
+
+%% -----------------------------
+% CALIBRATION ALGORITHM
+%% -----------------------------
+
+for lo = 1:num_LO
+    
+    freq = LO_freq(lo);
+    
+    % Frequency dependent RF gain variation
+    freq_error = 2*sin(freq/700);
+    
+    for g = 1:num_gain
+        
+        gain = gain_steps(g);
+        
+        rssi_accumulator = 0;
+        
+        for k = 1:avg_samples
+            
+            % RF Gain Model
+            gain_response = -40 + gain*0.5;
+            
+            % Thermal noise
+            noise = randn()*0.5;
+            
+            % Simulated RSSI
+            rssi_sample = gain_response + freq_error + noise;
+            
+            rssi_accumulator = rssi_accumulator + rssi_sample;
+            
+        end
+        
+        % DSP averaging filter
+        rssi_avg = rssi_accumulator / avg_samples;
+        
+        measured_RSSI(lo,g) = rssi_avg;
+        
+        % Calibration error
+        error = target_rssi - rssi_avg;
+        
+        % Store correction in LUT
+        calibration_LUT(lo,g) = error;
+        
+        % Apply correction
+        corrected_RSSI(lo,g) = rssi_avg + error;
+        
+    end
+    
+end
+
+disp('RSSI Calibration Completed');
+
+%% -----------------------------
+% RSSI BEFORE CALIBRATION
+%% -----------------------------
+
+figure
+
+imagesc(gain_steps,LO_freq,measured_RSSI)
+
+xlabel('Gain Step Index')
+ylabel('LO Frequency (MHz)')
+title('RSSI Before Calibration')
+
+colorbar
+grid on
+
+
+%% -----------------------------
+% CALIBRATION LUT HEATMAP
+%% -----------------------------
+
+figure
+
+imagesc(gain_steps,LO_freq,calibration_LUT)
+
+xlabel('Gain Step Index')
+ylabel('LO Frequency (MHz)')
+title('Calibration LUT (Gain Correction)')
+
+colorbar
+grid on
+
+
+%% -----------------------------
+% RSSI AFTER CALIBRATION
+%% -----------------------------
+
+figure
+
+imagesc(gain_steps,LO_freq,corrected_RSSI)
+
+xlabel('Gain Step Index')
+ylabel('LO Frequency (MHz)')
+title('RSSI After Calibration')
+
+colorbar
+grid on
+
+
+%% -----------------------------
+% GAIN CURVE AT ONE FREQUENCY
+%% -----------------------------
+
+freq_index = 10;
+
+figure
+
+plot(gain_steps,measured_RSSI(freq_index,:),'r','LineWidth',2)
+hold on
+plot(gain_steps,corrected_RSSI(freq_index,:),'b','LineWidth',2)
+
+xlabel('Gain Step Index')
+ylabel('RSSI (dBm)')
+title(['Calibration Effect at LO = ',num2str(LO_freq(freq_index)),' MHz'])
+
+legend('Before Calibration','After Calibration')
+
+grid on
+
+
+%% -----------------------------
+% 3D SURFACE OF RSSI
+%% -----------------------------
+
+[GAIN_GRID,LO_GRID] = meshgrid(gain_steps,LO_freq);
+
+figure
+
+surf(GAIN_GRID,LO_GRID,measured_RSSI)
+
+xlabel('Gain Step Index')
+ylabel('LO Frequency (MHz)')
+zlabel('RSSI')
+
+title('RSSI Surface Before Calibration')
+
+shading interp
+colorbar
+
+
+%% -----------------------------
+% EXPORT LUT FOR FPGA
+%% -----------------------------
+
+fid = fopen('AD9361_RSSI_LUT.hex','w');
+
+for i = 1:num_LO
+    for j = 1:num_gain
+        
+        fprintf(fid,'%d\n',round(calibration_LUT(i,j)));
+        
+    end
+end
+
+fclose(fid);
+
+disp('Calibration LUT exported for FPGA');
+
+
