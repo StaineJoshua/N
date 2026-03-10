@@ -1,0 +1,84 @@
+* Comparator generating +5V / -5V output
+
+Vin in 0 PULSE(0 5 0 1u 1u 5m 10m)
+
+Vcc Vp 0 5
+Vee Vn 0 -5
+
+* Reference divider
+R1 Vp ref 10k
+R2 ref 0 10k
+
+* Ideal opamp comparator
+E1 out 0 in ref 1e6
+
+.tran 20m
+
+.control
+run
+plot V(in) V(out)
+.endc
+
+.end
+
+                +5V
+                 │
+                R3 10k
+                 │
+                 │
+Vin ──R1 10k──► (+)      OPAMP
+                │ \ 
+                │  \________ Vout
+                │
+               (−)
+                │
+              R2 10k
+                │
+              Vref (2.5V)
+                │
+              R4 10k
+                │
+               GND
+
+
++5V
+ │
+10k
+ │
+---- Vref = 2.5 V
+ │
+10k
+ │
+GND
+
+
+
+* 0-5V to ±5V converter using opamp
+
+Vin in 0 PULSE(0 5 0 1u 1u 5m 10m)
+
+Vcc Vp 0 5
+Vee Vn 0 -5
+
+* Reference voltage divider
+R1 Vp ref 10k
+R2 ref 0 10k
+
+* Differential amplifier implementation
+E1 out 0 in ref 2
+
+.tran 20m
+
+.control
+run
+plot V(in) V(out)
+.endc
+
+.end
+
+
+level_shifter.cir
+
+
+
+level_shifter.cir
